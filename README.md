@@ -1,4 +1,6 @@
-# HacksGuard
+# HacksGuard 🛡️
+
+![HacksGuard Screenshot](assets/screenshot.png)
 
 HacksGuard is a blazingly fast Terminal UI (TUI) static analysis tool designed for malware analysts and reverse engineers. Built in Rust, it provides an intuitive dashboard for quick triage and deep inspection of Portable Executable (PE) files.
 
