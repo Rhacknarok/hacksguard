@@ -25,6 +25,7 @@ impl App {
         }
         tab_names.push("Hex View".into());
         tab_names.push("Strings".into());
+        tab_names.push("Entropy".into());
         tab_names.push("Guide".into());
 
         Self {

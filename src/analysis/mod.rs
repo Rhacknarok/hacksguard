@@ -23,52 +23,73 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult> {
         magic_bytes: magic,
     };
 
-    let basic_result = basic::analyze(&data);
+    let (basic_result, entropy_graph, pe_result, yara_matches, vt_score) = std::thread::scope(|s| {
+        let basic_handle = s.spawn(|| {
+            let b = basic::analyze(&data);
+            let e = compute_entropy_graph(&data, 64);
+            (b, e)
+        });
 
-    let pe_result = if file_type == FileType::PE {
-        pe::analyze(&data).ok()
-    } else {
-        None
-    };
+        let pe_handle = s.spawn(|| {
+            if file_type == FileType::PE {
+                pe::analyze(&data).ok()
+            } else {
+                None
+            }
+        });
+
+        let yara_handle = s.spawn(|| {
+            let mut yara_matches = Vec::new();
+            let mut compiler = boreal::Compiler::new();
+            if let Ok(entries) = std::fs::read_dir("rules") {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
+                        let _ = compiler.add_rules_file(&path);
+                    }
+                }
+            }
+            let scanner = compiler.finalize();
+            let res = match scanner.scan_mem(&data) {
+                Ok(res) => res,
+                Err((_, res)) => res,
+            };
+            yara_matches.extend(res.rules.iter().map(|r| r.name.to_string()));
+            yara_matches
+        });
+
+        let (basic, entropy) = basic_handle.join().unwrap();
+
+        let vt_sha256 = basic.sha256.clone();
+        let vt_handle = s.spawn(move || {
+            let mut vt_score = None;
+            if let Ok(api_key) = std::env::var("VT_API_KEY") {
+                if let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(3)).build() {
+                    let url = format!("https://www.virustotal.com/api/v3/files/{}", vt_sha256);
+                    if let Ok(res) = client.get(&url).header("x-apikey", api_key).send() {
+                        if let Ok(json) = res.json::<serde_json::Value>() {
+                            if let Some(stats) = json["data"]["attributes"]["last_analysis_stats"].as_object() {
+                                let malicious = stats["malicious"].as_u64().unwrap_or(0);
+                                let total = malicious + stats["undetected"].as_u64().unwrap_or(0) + stats["harmless"].as_u64().unwrap_or(0);
+                                vt_score = Some(format!("{}/{}", malicious, total));
+                            }
+                        }
+                    }
+                }
+            }
+            vt_score
+        });
+
+        let pe = pe_handle.join().unwrap();
+        let yara = yara_handle.join().unwrap();
+        let vt = vt_handle.join().unwrap();
+
+        (basic, entropy, pe, yara, vt)
+    });
 
     let (risk_score, risk_level, risk_breakdown) = compute_risk(&basic_result, &pe_result);
     let detection_checks = build_detection_checks(&basic_result, &pe_result);
     let malware_pattern = detect_malware_pattern(&basic_result, &pe_result);
-
-    let mut yara_matches = Vec::new();
-    let mut compiler = boreal::Compiler::new();
-    
-    // Load all YARA rules from the `rules` directory
-    if let Ok(entries) = std::fs::read_dir("rules") {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
-                let _ = compiler.add_rules_file(&path);
-            }
-        }
-    }
-    let scanner = compiler.finalize();
-    let res = match scanner.scan_mem(&data) {
-        Ok(res) => res,
-        Err((_, res)) => res,
-    };
-    yara_matches.extend(res.rules.iter().map(|r| r.name.to_string()));
-
-    let mut vt_score = None;
-    if let Ok(api_key) = std::env::var("VT_API_KEY") {
-        if let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(3)).build() {
-            let url = format!("https://www.virustotal.com/api/v3/files/{}", basic_result.sha256);
-            if let Ok(res) = client.get(&url).header("x-apikey", api_key).send() {
-                if let Ok(json) = res.json::<serde_json::Value>() {
-                    if let Some(stats) = json["data"]["attributes"]["last_analysis_stats"].as_object() {
-                        let malicious = stats["malicious"].as_u64().unwrap_or(0);
-                        let total = malicious + stats["undetected"].as_u64().unwrap_or(0) + stats["harmless"].as_u64().unwrap_or(0);
-                        vt_score = Some(format!("{}/{}", malicious, total));
-                    }
-                }
-            }
-        }
-    }
 
     Ok(AnalysisResult {
         file_info,
@@ -81,7 +102,25 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult> {
         malware_pattern,
         vt_score,
         yara_matches,
+        entropy_graph,
     })
+}
+
+fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
+    if data.is_empty() {
+        return vec![0; num_chunks];
+    }
+    let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
+    let mut graph = Vec::with_capacity(num_chunks);
+    for chunk in data.chunks(chunk_size) {
+        let entropy = basic::shannon_entropy(chunk);
+        // Scale 0.0-8.0 to 0-800 for better visual resolution
+        graph.push((entropy * 100.0) as u64);
+    }
+    while graph.len() < num_chunks {
+        graph.push(0);
+    }
+    graph
 }
 
 // ─── File type detection via magic bytes ─────────────────────────

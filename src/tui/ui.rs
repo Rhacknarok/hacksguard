@@ -32,6 +32,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         "Headers" => draw_headers(frame, chunks[2], app),
         "Sections" => draw_sections(frame, chunks[2], app),
         "Imports" => draw_imports(frame, chunks[2], app),
+        "Entropy" => draw_entropy(frame, chunks[2], app),
         "Disasm" => draw_disasm(frame, chunks[2], app),
         "Hex View" => draw_hexdump(frame, chunks[2], app),
         "Strings" => draw_strings(frame, chunks[2], app),
@@ -261,6 +262,10 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
         ));
         lines.push(kv_line("Subsystem", &pe.subsystem));
         lines.push(kv_line("Linker", &pe.linker_version));
+        
+        if let (Some(offset), Some(size)) = (pe.overlay_offset, pe.overlay_size) {
+            lines.push(kv_line("Overlay", &format!("Offset {:#x}, Size {}", offset, size)));
+        }
 
         let ts_color = if pe.timestamp_suspicious {
             theme::WARNING
@@ -1177,6 +1182,23 @@ fn draw_strings(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(display_val, Style::default().fg(theme::TEXT)),
         ]));
+
+        if let Some(decoded) = &s.decoded {
+            let decoded_display = if decoded.len() > 100 {
+                format!("{}…", &decoded[..100])
+            } else {
+                decoded.clone()
+            };
+            let mut decoded_line = Vec::new();
+            decoded_line.push(Span::styled(
+                "        ↳ Base64 Decoded: ",
+                Style::default().fg(theme::INFO),
+            ));
+            // Ensure no invalid control characters break the TUI
+            let safe_decoded = decoded_display.replace(|c: char| c.is_control() && c != '\n' && c != '\t', ".");
+            decoded_line.push(Span::styled(safe_decoded, Style::default().fg(theme::TEXT)));
+            lines.push(Line::from(decoded_line));
+        }
     }
 
     if strings.len() > 500 {
@@ -1277,73 +1299,74 @@ fn detection_severity_color(sev: &DetectionSeverity) -> Color {
 fn draw_guide(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
     
-    // Titre principal
+    // Main Title
     lines.push(Line::from(vec![
-        Span::styled(" Guide d'Interprétation HacksGuard ", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
+        Span::styled(" HacksGuard Analyst Guide ", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
     ]));
     lines.push(Line::from(""));
 
-    // 1. Score de Risque
-    lines.push(section_header("1. Score de Risque (Risk Score)"));
-    lines.push(Line::from(vec![Span::styled("Le score global (0-100) indique la probabilité qu'un fichier soit malveillant. Il est calculé selon 5 axes :", Style::default().fg(theme::TEXT))]));
-    lines.push(Line::from(vec![Span::styled(" • Entropy (25 pts) : ", theme::label()), Span::styled("Mesure la compression/chiffrement du code.", theme::value())]));
-    lines.push(Line::from(vec![Span::styled(" • APIs (25 pts) : ", theme::label()), Span::styled("Fonctions importées critiques (injection, keyloggers, etc).", theme::value())]));
-    lines.push(Line::from(vec![Span::styled(" • Anomalies (25 pts) : ", theme::label()), Span::styled("Violations du format PE (ex: Entry Point en dehors du code).", theme::value())]));
-    lines.push(Line::from(vec![Span::styled(" • Strings (15 pts) : ", theme::label()), Span::styled("Chaînes suspectes (URLs, IPs, commandes PowerShell, chemins système).", theme::value())]));
-    lines.push(Line::from(vec![Span::styled(" • Packing (15 pts) : ", theme::label()), Span::styled("Présence d'un packer connu (UPX, Themida, VMProtect).", theme::value())]));
+    // 1. Risk Score
+    lines.push(section_header("1. Risk Score"));
+    lines.push(Line::from(vec![Span::styled("The global score (0-100) indicates the probability that a file is malicious. It is calculated across 5 axes:", Style::default().fg(theme::TEXT))]));
+    lines.push(Line::from(vec![Span::styled(" • Entropy (25 pts) : ", theme::label()), Span::styled("Measures code compression or encryption.", theme::value())]));
+    lines.push(Line::from(vec![Span::styled(" • APIs (25 pts) : ", theme::label()), Span::styled("Critical imported functions (injection, keyloggers, etc).", theme::value())]));
+    lines.push(Line::from(vec![Span::styled(" • Anomalies (25 pts) : ", theme::label()), Span::styled("PE format violations (e.g. Entry Point outside of code).", theme::value())]));
+    lines.push(Line::from(vec![Span::styled(" • Strings (15 pts) : ", theme::label()), Span::styled("Suspicious strings (URLs, IPs, PowerShell cmds, system paths).", theme::value())]));
+    lines.push(Line::from(vec![Span::styled(" • Packing (15 pts) : ", theme::label()), Span::styled("Presence of a known packer (UPX, Themida, VMProtect).", theme::value())]));
     lines.push(Line::from(""));
 
-    // 2. Entropie
-    lines.push(section_header("2. Entropie (Shannon Entropy)"));
-    lines.push(Line::from(vec![Span::styled("L'entropie mesure le désordre des données sur une échelle de 0 à 8.", Style::default().fg(theme::TEXT))]));
-    lines.push(Line::from(vec![Span::styled(" • < 6.0 : ", theme::label()), Span::styled("Données normales (code compilé standard, texte clair).", theme::SAFE)]));
-    lines.push(Line::from(vec![Span::styled(" • 6.0 - 7.0 : ", theme::label()), Span::styled("Zone grise (possiblement compressé ou données denses).", theme::WARNING)]));
-    lines.push(Line::from(vec![Span::styled(" • > 7.0 : ", theme::label()), Span::styled("Hautement suspect. Le code est très probablement obfusqué, chiffré ou packé.", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled("Astuce : ", theme::label()), Span::styled("Si l'entropie d'une section exécutable (.text) est de 7.9+, un malware tente de se cacher.", theme::value())]));
+    // 2. Entropy & Overlay
+    lines.push(section_header("2. Entropy & Overlay Analysis"));
+    lines.push(Line::from(vec![Span::styled("Entropy measures data randomness on a scale of 0 to 8.", Style::default().fg(theme::TEXT))]));
+    lines.push(Line::from(vec![Span::styled(" • < 6.0 : ", theme::label()), Span::styled("Normal data (standard compiled code, plaintext).", theme::SAFE)]));
+    lines.push(Line::from(vec![Span::styled(" • 6.0 - 7.0 : ", theme::label()), Span::styled("Gray zone (possibly compressed or dense data).", theme::WARNING)]));
+    lines.push(Line::from(vec![Span::styled(" • > 7.0 : ", theme::label()), Span::styled("Highly suspicious. Code is very likely obfuscated, encrypted, or packed.", theme::CRITICAL)]));
+    lines.push(Line::from(vec![Span::styled("Tip : ", theme::label()), Span::styled("If an executable section (.text) has an entropy of 7.9+, a malware is trying to hide.", theme::value())]));
+    lines.push(Line::from(vec![Span::styled("Overlay : ", theme::label()), Span::styled("Data appended to the end of the binary. Often used by droppers or installers to hide payloads.", theme::value())]));
     lines.push(Line::from(""));
 
-    // 3. Packers
-    lines.push(section_header("3. Packers & Obfuscation"));
-    lines.push(Line::from(vec![Span::styled("Un 'packer' compresse ou chiffre l'exécutable pour empêcher son analyse statique.", Style::default().fg(theme::TEXT))]));
-    lines.push(Line::from(vec![Span::styled(" • UPX / MPRESS : ", theme::label()), Span::styled("Packers communs, parfois légitimes, mais souvent abusés.", theme::WARNING)]));
-    lines.push(Line::from(vec![Span::styled(" • Themida / VMProtect : ", theme::label()), Span::styled("Outils commerciaux d'obfuscation très puissants. Haut risque.", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled("Si un fichier est packé, l'analyse statique seule peut ne pas voir la charge utile (payload).", theme::value())]));
+    // 3. Packers & YARA
+    lines.push(section_header("3. Packers & YARA Analysis"));
+    lines.push(Line::from(vec![Span::styled("A 'packer' compresses or encrypts the executable to prevent static analysis.", Style::default().fg(theme::TEXT))]));
+    lines.push(Line::from(vec![Span::styled(" • UPX / MPRESS : ", theme::label()), Span::styled("Common packers, sometimes legitimate, but often abused.", theme::WARNING)]));
+    lines.push(Line::from(vec![Span::styled(" • Themida / VMProtect : ", theme::label()), Span::styled("Extremely powerful commercial obfuscation tools. High risk.", theme::CRITICAL)]));
+    lines.push(Line::from(vec![Span::styled("YARA : ", theme::label()), Span::styled("HacksGuard uses the Elastic protections-artifacts YARA rules to detect specific malware families and behaviors.", theme::value())]));
     lines.push(Line::from(""));
 
     // 4. Imports & APIs
-    lines.push(section_header("4. APIs et Imports (Import Address Table)"));
-    lines.push(Line::from(vec![Span::styled("Montre avec quelles librairies (DLLs) le fichier interagit.", Style::default().fg(theme::TEXT))]));
-    lines.push(Line::from(vec![Span::styled(" • Injection de processus : ", theme::label()), Span::styled("VirtualAllocEx, WriteProcessMemory, CreateRemoteThread.", theme::CRITICAL)]));
+    lines.push(section_header("4. APIs & Imports (Import Address Table)"));
+    lines.push(Line::from(vec![Span::styled("Shows which system libraries (DLLs) the file interacts with.", Style::default().fg(theme::TEXT))]));
+    lines.push(Line::from(vec![Span::styled(" • Process Injection : ", theme::label()), Span::styled("VirtualAllocEx, WriteProcessMemory, CreateRemoteThread.", theme::CRITICAL)]));
     lines.push(Line::from(vec![Span::styled(" • Keylogging / Hooking : ", theme::label()), Span::styled("SetWindowsHookEx, GetAsyncKeyState.", theme::CRITICAL)]));
     lines.push(Line::from(vec![Span::styled(" • Anti-Debugging : ", theme::label()), Span::styled("IsDebuggerPresent, CheckRemoteDebuggerPresent.", theme::ORANGE)]));
     lines.push(Line::from(vec![Span::styled(" • Ransomware : ", theme::label()), Span::styled("CryptEncrypt, WNetOpenEnum, DeleteFile.", theme::ORANGE)]));
     lines.push(Line::from(""));
 
-    // 5. Anomalies PE
-    lines.push(section_header("5. Anomalies du format PE"));
-    lines.push(Line::from(vec![Span::styled("Indicateurs que le fichier a été manipulé ou forgé manuellement :", Style::default().fg(theme::TEXT))]));
-    lines.push(Line::from(vec![Span::styled(" • W+X (Write + Execute) : ", theme::label()), Span::styled("Une section ne devrait jamais être inscriptible ET exécutable (risque d'injection/shellcode).", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled(" • Timestamp 0 ou Futur : ", theme::label()), Span::styled("L'auteur a falsifié ou effacé la date de compilation.", theme::WARNING)]));
-    lines.push(Line::from(vec![Span::styled(" • Entry Point hors limites : ", theme::label()), Span::styled("L'exécution démarre dans une zone inhabituelle (hors du code).", theme::CRITICAL)]));
+    // 5. PE Anomalies
+    lines.push(section_header("5. PE Format Anomalies"));
+    lines.push(Line::from(vec![Span::styled("Indicators that the file was manually manipulated or forged:", Style::default().fg(theme::TEXT))]));
+    lines.push(Line::from(vec![Span::styled(" • W+X (Write + Execute) : ", theme::label()), Span::styled("A section should never be writable AND executable (risk of injection/shellcode).", theme::CRITICAL)]));
+    lines.push(Line::from(vec![Span::styled(" • Timestamp 0 or Future : ", theme::label()), Span::styled("The author forged or wiped the compilation date.", theme::WARNING)]));
+    lines.push(Line::from(vec![Span::styled(" • Entry Point out of bounds : ", theme::label()), Span::styled("Execution starts in an unusual area (outside of code).", theme::CRITICAL)]));
     lines.push(Line::from(""));
 
-    // 6. Chaînes de caractères (Strings)
-    lines.push(section_header("6. Strings (Chaînes suspectes)"));
-    lines.push(Line::from(vec![Span::styled("Le texte brut extrait du fichier révèle souvent l'intention de l'auteur.", Style::default().fg(theme::TEXT))]));
-    lines.push(Line::from(vec![Span::styled(" • URLs & IPs : ", theme::label()), Span::styled("Serveurs de Command & Control (C2) ou adresses de téléchargement (Droppers).", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled(" • Commandes : ", theme::label()), Span::styled("Exécution furtive via 'cmd.exe /c', 'powershell -enc', 'vssadmin delete shadows'.", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled(" • Registre : ", theme::label()), Span::styled("Clés de persistance (Run, RunOnce) permettant de lancer le malware au démarrage.", theme::WARNING)]));
+    // 6. Strings & Decoding
+    lines.push(section_header("6. Strings & Auto-Decoding"));
+    lines.push(Line::from(vec![Span::styled("Raw text extracted from the file often reveals the author's intent.", Style::default().fg(theme::TEXT))]));
+    lines.push(Line::from(vec![Span::styled(" • URLs & IPs : ", theme::label()), Span::styled("Command & Control (C2) servers or download addresses (Droppers).", theme::CRITICAL)]));
+    lines.push(Line::from(vec![Span::styled(" • Commands : ", theme::label()), Span::styled("Stealth execution via 'cmd.exe /c', 'powershell -enc', 'vssadmin delete shadows'.", theme::CRITICAL)]));
+    lines.push(Line::from(vec![Span::styled(" • Base64 Decoding : ", theme::label()), Span::styled("HacksGuard automatically attempts to decode strings longer than 16 characters that match the Base64 alphabet.", theme::value())]));
     lines.push(Line::from(""));
 
-    // 7. Malware Patterns (Familles)
-    lines.push(section_header("7. Malware Patterns (YARA-like)"));
-    lines.push(Line::from(vec![Span::styled("Recherche d'ensembles d'indicateurs (heuristiques) correspondant à des menaces connues :", Style::default().fg(theme::TEXT))]));
-    lines.push(Line::from(vec![Span::styled(" • Ransomware : ", theme::label()), Span::styled("Chiffrement + suppression de sauvegardes.", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled(" • Info Stealer : ", theme::label()), Span::styled("Recherche de navigateurs + exfiltration réseau.", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled(" • Dropper : ", theme::label()), Span::styled("Petite taille + téléchargement de payload via HTTP.", theme::CRITICAL)]));
+    // 7. Malware Patterns
+    lines.push(section_header("7. Malware Patterns"));
+    lines.push(Line::from(vec![Span::styled("Search for sets of indicators (heuristics) corresponding to known threats:", Style::default().fg(theme::TEXT))]));
+    lines.push(Line::from(vec![Span::styled(" • Ransomware : ", theme::label()), Span::styled("Encryption + backup deletion + shadow copies removal.", theme::CRITICAL)]));
+    lines.push(Line::from(vec![Span::styled(" • Info Stealer : ", theme::label()), Span::styled("Browser hooking + network exfiltration.", theme::CRITICAL)]));
+    lines.push(Line::from(vec![Span::styled(" • Dropper : ", theme::label()), Span::styled("Small size + HTTP payload downloading + overlay execution.", theme::CRITICAL)]));
     lines.push(Line::from(""));
 
-    let block = panel_block("Guide de l'Analyste");
+    let block = panel_block("Analyst Guide");
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -1462,4 +1485,20 @@ fn draw_hexdump(frame: &mut Frame, area: Rect, app: &App) {
             .scroll((app.scroll_offset, 0)),
         area,
     );
+}
+
+// ─── Entropy tab ─────────────────────────────────────────────────
+
+fn draw_entropy(frame: &mut Frame, area: Rect, app: &App) {
+    let sparkline = ratatui::widgets::Sparkline::default()
+        .block(
+            Block::default()
+                .title(" Full File Entropy Graph ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::BORDER)),
+        )
+        .data(&app.result.entropy_graph)
+        .max(800)
+        .style(Style::default().fg(theme::ORANGE));
+    frame.render_widget(sparkline, area);
 }

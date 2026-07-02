@@ -719,6 +719,7 @@ dependencies = [
 name = "hacksguard"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "boreal",
  "clap",
  "color-eyre",
@@ -728,6 +729,7 @@ dependencies = [
  "md-5",
  "ratatui",
  "reqwest",
+ "serde",
  "serde_json",
  "sha1",
  "sha2",

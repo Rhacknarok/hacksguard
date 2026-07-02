@@ -14,6 +14,9 @@ use std::path::PathBuf;
 struct Cli {
     /// Path to the file to analyze
     file: PathBuf,
+    /// Output JSON analysis to stdout instead of launching the TUI
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> Result<()> {
@@ -25,8 +28,17 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    eprintln!("[*] Analyzing {}...", cli.file.display());
+    if !cli.json {
+        eprintln!("[*] Analyzing {}...", cli.file.display());
+    }
+    
     let result = analysis::analyze_file(&cli.file)?;
+    
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    
     eprintln!(
         "[+] Risk: {}/100 ({})",
         result.risk_score, result.risk_level

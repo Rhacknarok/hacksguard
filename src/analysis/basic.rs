@@ -22,7 +22,7 @@ pub fn analyze(data: &[u8]) -> BasicAnalysis {
         entropy,
         strings,
         is_packed,
-        byte_distribution,
+        byte_distribution: byte_distribution.to_vec(),
     }
 }
 
@@ -75,10 +75,17 @@ fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
             if current.len() >= min_len {
                 let s = String::from_utf8_lossy(&current).to_string();
                 let category = categorize_string(&s);
+                let decoded = if is_base64_like(&s) {
+                    use base64::{Engine as _, engine::general_purpose};
+                    general_purpose::STANDARD.decode(&s).ok().and_then(|b| String::from_utf8(b).ok())
+                } else {
+                    None
+                };
                 results.push(ExtractedString {
                     value: s,
                     offset: start_offset,
                     category,
+                    decoded,
                 });
             }
             current.clear();
@@ -88,14 +95,37 @@ fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
     if current.len() >= min_len {
         let s = String::from_utf8_lossy(&current).to_string();
         let category = categorize_string(&s);
+        let decoded = if is_base64_like(&s) {
+            use base64::{Engine as _, engine::general_purpose};
+            general_purpose::STANDARD.decode(&s).ok().and_then(|b| String::from_utf8(b).ok())
+        } else {
+            None
+        };
         results.push(ExtractedString {
             value: s,
             offset: start_offset,
             category,
+            decoded,
         });
     }
 
     results
+}
+
+fn is_base64_like(s: &str) -> bool {
+    if s.len() <= 16 { return false; }
+    let mut equals_count = 0;
+    for (i, c) in s.chars().enumerate() {
+        if c == '=' {
+            equals_count += 1;
+            if equals_count > 2 || i < s.len() - 2 {
+                return false;
+            }
+        } else if !c.is_ascii_alphanumeric() && c != '+' && c != '/' {
+            return false;
+        }
+    }
+    s.len() % 4 == 0
 }
 
 fn categorize_string(s: &str) -> StringCategory {

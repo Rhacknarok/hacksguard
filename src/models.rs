@@ -4,6 +4,7 @@ use std::path::PathBuf;
 // ─── Top-level result ────────────────────────────────────────────
 
 /// Complete analysis result for a single file.
+#[derive(serde::Serialize)]
 pub struct AnalysisResult {
     pub file_info: FileInfo,
     pub basic: BasicAnalysis,
@@ -15,10 +16,12 @@ pub struct AnalysisResult {
     pub malware_pattern: Option<MalwarePattern>,
     pub yara_matches: Vec<String>,
     pub vt_score: Option<String>,
+    pub entropy_graph: Vec<u64>,
 }
 
 // ─── File info ───────────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct FileInfo {
     pub path: PathBuf,
     pub name: String,
@@ -28,6 +31,7 @@ pub struct FileInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub enum FileType {
     PE,
     ELF,
@@ -48,6 +52,7 @@ impl fmt::Display for FileType {
 
 // ─── Basic analysis ──────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct BasicAnalysis {
     pub md5: String,
     pub sha1: String,
@@ -55,16 +60,19 @@ pub struct BasicAnalysis {
     pub entropy: f64,
     pub strings: Vec<ExtractedString>,
     pub is_packed: bool,
-    pub byte_distribution: [u64; 256],
+    pub byte_distribution: Vec<u64>,
 }
 
+#[derive(serde::Serialize)]
 pub struct ExtractedString {
     pub value: String,
     pub offset: usize,
     pub category: StringCategory,
+    pub decoded: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub enum StringCategory {
     Url,
     IpAddress,
@@ -91,6 +99,7 @@ impl fmt::Display for StringCategory {
 
 // ─── PE analysis ─────────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct PeAnalysis {
     pub machine: String,
     pub timestamp: u32,
@@ -114,8 +123,11 @@ pub struct PeAnalysis {
     pub entry_point_section: Option<String>,
     pub has_authenticode: bool,
     pub ep_bytes: Vec<u8>,
+    pub overlay_offset: Option<usize>,
+    pub overlay_size: Option<usize>,
 }
 
+#[derive(serde::Serialize)]
 pub struct SectionInfo {
     pub name: String,
     pub virtual_address: u64,
@@ -129,23 +141,27 @@ pub struct SectionInfo {
     pub anomalies: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
 pub struct ImportDll {
     pub name: String,
     pub functions: Vec<ImportFunction>,
 }
 
+#[derive(serde::Serialize)]
 pub struct DataDirectory {
     pub name: String,
     pub virtual_address: u32,
     pub size: u32,
 }
 
+#[derive(serde::Serialize)]
 pub struct ImportFunction {
     pub name: String,
     pub risk: ApiRisk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(serde::Serialize)]
 pub enum ApiRisk {
     None,
     Low,
@@ -169,6 +185,7 @@ impl fmt::Display for ApiRisk {
 // ─── Risk scoring ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub enum RiskLevel {
     Clean,
     Low,
@@ -191,12 +208,14 @@ impl fmt::Display for RiskLevel {
 
 // ─── Anomalies ───────────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct Anomaly {
     pub severity: AnomalySeverity,
     pub description: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub enum AnomalySeverity {
     Critical,
     Warning,
@@ -215,6 +234,7 @@ impl fmt::Display for AnomalySeverity {
 
 // ─── Risk breakdown (radar chart) ────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct RiskBreakdown {
     pub entropy_score: u32,
     pub api_score: u32,
@@ -225,6 +245,7 @@ pub struct RiskBreakdown {
 
 // ─── Detection checks ───────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct DetectionCheck {
     pub name: String,
     pub triggered: bool,
@@ -232,6 +253,7 @@ pub struct DetectionCheck {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub enum DetectionSeverity {
     Critical,
     High,
@@ -254,6 +276,7 @@ impl fmt::Display for DetectionSeverity {
 
 // ─── Malware pattern matching ────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct MalwarePattern {
     pub family: String,
     pub confidence: String,

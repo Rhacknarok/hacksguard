@@ -116,6 +116,20 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         });
     }
 
+    let mut last_section_end = 0;
+    for sec in &pe.sections {
+        let sec_end = (sec.pointer_to_raw_data + sec.size_of_raw_data) as usize;
+        if sec_end > last_section_end {
+            last_section_end = sec_end;
+        }
+    }
+
+    let (overlay_offset, overlay_size) = if data.len() > last_section_end && last_section_end > 0 {
+        (Some(last_section_end), Some(data.len() - last_section_end))
+    } else {
+        (None, None)
+    };
+
     // ── Imports (group by DLL) ──
     let mut dll_map: BTreeMap<String, Vec<ImportFunction>> = BTreeMap::new();
     for import in &pe.imports {
@@ -308,6 +322,8 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         entry_point_section,
         has_authenticode,
         ep_bytes,
+        overlay_offset,
+        overlay_size,
     })
 }
 
