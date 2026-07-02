@@ -37,38 +37,22 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult> {
 
     let mut yara_matches = Vec::new();
     let mut compiler = boreal::Compiler::new();
-    let yara_rules = r#"
-        rule Suspicious_Strings {
-            strings:
-                $cmd = "cmd.exe" ascii wide nocase
-                $ps = "powershell" ascii wide nocase
-                $vss = "vssadmin" ascii wide nocase
-                $http = "http://" ascii wide nocase
-            condition:
-                any of them
+    
+    // Load all YARA rules from the `rules` directory
+    if let Ok(entries) = std::fs::read_dir("rules") {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
+                let _ = compiler.add_rules_file(&path);
+            }
         }
-        rule Cryptography {
-            strings:
-                $crypt = "CryptAcquireContext" ascii wide
-            condition:
-                any of them
-        }
-        rule Anti_Analysis {
-            strings:
-                $dbg = "IsDebuggerPresent" ascii wide
-                $vm = "VMware" ascii wide nocase
-            condition:
-                any of them
-        }
-    "#;
-    if compiler.add_rules_str(yara_rules).is_ok() {
-        let scanner = compiler.finalize();
-        let res = match scanner.scan_mem(&data) {
-            Ok(res) => res,
-            Err((_, res)) => res,
-        };
-        yara_matches.extend(res.rules.iter().map(|r| r.name.to_string()));
     }
+    let scanner = compiler.finalize();
+    let res = match scanner.scan_mem(&data) {
+        Ok(res) => res,
+        Err((_, res)) => res,
+    };
+    yara_matches.extend(res.rules.iter().map(|r| r.name.to_string()));
 
     let mut vt_score = None;
     if let Ok(api_key) = std::env::var("VT_API_KEY") {

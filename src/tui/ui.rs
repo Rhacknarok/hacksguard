@@ -197,6 +197,7 @@ fn draw_overview_body(frame: &mut Frame, area: Rect, app: &App) {
     build_import_heatmap_lines(&mut right_lines, app);
     build_suspicious_strings_lines(&mut right_lines, app);
     build_malware_pattern_lines(&mut right_lines, app);
+    build_yara_lines(&mut right_lines, app);
     build_anomalies_lines(&mut right_lines, app);
 
     frame.render_widget(
@@ -244,12 +245,7 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     if let Some(vt) = &app.result.vt_score {
         lines.push(kv_line("VT Score", vt));
     }
-    let yara_str = if app.result.yara_matches.is_empty() {
-        "None".to_string()
-    } else {
-        app.result.yara_matches.join(", ")
-    };
-    lines.push(kv_line("YARA Matches", &yara_str));
+
 
     if let Some(pe) = &app.result.pe {
         lines.push(Line::from(""));
@@ -765,6 +761,27 @@ fn build_malware_pattern_lines(lines: &mut Vec<Line<'static>>, app: &App) {
         ]));
     }
     lines.push(Line::from(""));
+}
+
+fn build_yara_lines(lines: &mut Vec<Line<'static>>, app: &App) {
+    lines.push(Line::from(""));
+    lines.push(section_header("YARA Analysis"));
+
+    if app.result.yara_matches.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" No YARA rules matched", theme::label()),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} rules matched:", app.result.yara_matches.len()), Style::default().fg(theme::WARNING)),
+        ]));
+        for rule in &app.result.yara_matches {
+            lines.push(Line::from(vec![
+                Span::styled("  • ", theme::label()),
+                Span::styled(rule.clone(), Style::default().fg(theme::CRITICAL)),
+            ]));
+        }
+    }
 }
 
 fn build_anomalies_lines(lines: &mut Vec<Line<'static>>, app: &App) {
