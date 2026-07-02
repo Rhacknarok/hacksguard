@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+.env
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.codegraph/
+test_goblin.rs
