@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Rhacknarok - https://github.com/Rhacknarok/hacksguard
+
 mod analysis;
 mod app;
 mod models;

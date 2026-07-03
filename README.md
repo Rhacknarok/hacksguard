@@ -1,33 +1,42 @@
-# HacksGuard 🛡️
+# HacksGuard - Blazing Fast TUI Malware Analysis Tool 🛡️
 
-![HacksGuard Screenshot](assets/screenshot.png)
+![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust)
+![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-lightgrey?style=flat-square)
 
-HacksGuard is a blazingly fast Terminal UI (TUI) static analysis tool designed for malware analysts and reverse engineers. Built in Rust, it provides an intuitive dashboard for quick triage and deep inspection of Portable Executable (PE) files.
+![HacksGuard TUI Malware Analysis Dashboard](assets/screenshot.png)
 
-## Features
+HacksGuard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis tool designed for SOC analysts, threat hunters, and reverse engineers. Built entirely in Rust, it provides an intuitive dashboard for quick triage and deep inspection of Portable Executable (PE) files right from your terminal.
 
-- **Dashboard Overview**: Automatically calculates a Risk Score based on entropy, APIs, anomalies, strings, and packing. Includes an intuitive heuristics radar and a visual **Entropy Graph (Sparkline)**.
-- **YARA Integration**: Dynamically loads YARA rules from the `rules/` directory (e.g. Elastic protections-artifacts) via the `boreal` engine.
-- **VirusTotal API**: Fetches real-time community scores (requires `VT_API_KEY` environment variable).
-- **Deep PE Parsing**: Inspects Sections, Imports (grouped by risk), Exports, Anomalies, Data Directories, Security Mitigations (ASLR, DEP, CFG), and Authenticode signatures.
-- **Overlay Analysis**: Detects appended data (overlay) at the end of the binary, often used by droppers or installers.
-- **Disassembler**: Raw x86/x64 instruction preview at the Entry Point via `iced-x86`.
-- **Hex Dump**: Built-in hex viewer for quick binary inspection.
-- **String Extraction & Auto-Decoding**: Fast string dumping with automatic Base64 decryption for suspicious strings.
-- **CLI Export**: Run with `--json` to bypass the TUI and export the full analysis report as a JSON object to stdout.
-- **Built-in Guide**: Included analyst guide to help interpret the results correctly.
+## 🌟 Key Features
 
-## Installation
+- **Blazing Fast & Multi-Threaded**: The core analysis pipeline (PE parsing, YARA scanning, VirusTotal queries, and entropy calculation) runs concurrently. This ensures zero UI latency, even when analyzing large executables.
+- **Advanced Risk Scoring**: HacksGuard automatically compiles a 0-100% Risk Score based on 5 heuristic axes (Entropy, Suspicious APIs, PE Anomalies, Strings, and Packing), visualized beautifully through an interactive radar chart.
+- **Integrated YARA Engine**: Powered by the `boreal` crate, HacksGuard dynamically loads local YARA rules (e.g., Elastic protections-artifacts) to detect known threats, packers, and evasion techniques.
+- **Deep PE Inspection**: Comprehensive breakdown of the PE format, including Headers, Sections, Imports (categorized by severity), Exports, Security Mitigations (ASLR, DEP, CFG), and Authenticode verification.
+- **Visual Entropy Graph**: A dedicated Entropy tab plots the Shannon entropy distribution of the file using sparklines, allowing analysts to visually spot encrypted or packed payloads instantly.
+- **Auto-Decoding Strings**: Automatically extracts and categorizes strings (IPs, URLs, Registry keys). Suspicious strings matching the Base64 alphabet are decoded on the fly directly in the interface.
+- **Built-in Disassembler & Hex View**: Inspect raw x86/x64 opcodes at the Entry Point via the `iced-x86` integration, or dive into raw bytes with the built-in Hex Dump viewer.
+- **Overlay Detection**: Automatically detects appended hidden data at the end of the binary, a technique commonly used by droppers and malicious installers.
+- **CLI Mode / CI-CD Ready**: Run `hacksguard --json <file>` to bypass the terminal UI and export the full analysis report as a structured JSON object for SIEM/SOAR integrations.
 
-Ensure you have Rust installed. Clone the repository and build:
+## 📦 Installation
+
+To use the VirusTotal features, you will need to set the `VT_API_KEY` environment variable.
+
+### Building from source
+
+Make sure you have Rust and Cargo installed, then run:
 
 ```bash
-git clone https://github.com/yourusername/hacksguard.git
+git clone https://github.com/your-username/hacksguard.git
 cd hacksguard
 cargo build --release
 ```
 
-## Usage
+The compiled binary will be available at `target/release/hacksguard`.
+
+## 🚀 Usage
 
 Run HacksGuard by providing the path to the executable you want to analyze:
 
@@ -50,3 +59,7 @@ cargo run --release -- <path/to/binary.exe>
 - `boreal` - Pure Rust YARA engine
 - `iced-x86` - Disassembler
 - `reqwest` - VirusTotal API client
+
+## 🔗 Related Projects
+
+- [Elastic Protections Artifacts](https://github.com/elastic/protections-artifacts) - YARA rules
