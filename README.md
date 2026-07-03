@@ -27,7 +27,7 @@ HacksGuard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis
 Make sure you have Rust and Cargo installed, then run:
 
 ```bash
-git clone https://github.com/your-username/hacksguard.git
+git clone https://github.com/Rhacknarok/hacksguard.git
 cd hacksguard
 cargo build --release
 ```
