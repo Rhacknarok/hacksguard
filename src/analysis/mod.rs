@@ -7,7 +7,9 @@ use std::path::Path;
 
 /// Run the full analysis pipeline on a file.
 pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>>) -> Result<AnalysisResult> {
-    let data = std::fs::read(path)?;
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let data = &mmap[..];
 
     let magic: Vec<u8> = data.iter().take(16).copied().collect();
     let file_type = detect_type(&magic);
@@ -90,12 +92,16 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
         return vec![0; num_chunks];
     }
     let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
-    let mut graph = Vec::with_capacity(num_chunks);
-    for chunk in data.chunks(chunk_size) {
-        let entropy = basic::shannon_entropy(chunk);
-        // Scale 0.0-8.0 to 0-800 for better visual resolution
-        graph.push((entropy * 100.0) as u64);
-    }
+    
+    use rayon::prelude::*;
+    let mut graph: Vec<u64> = data.par_chunks(chunk_size)
+        .map(|chunk| {
+            let entropy = basic::shannon_entropy(chunk);
+            // Scale 0.0-8.0 to 0-800 for better visual resolution
+            (entropy * 100.0) as u64
+        })
+        .collect();
+    
     while graph.len() < num_chunks {
         graph.push(0);
     }

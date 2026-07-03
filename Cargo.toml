@@ -13,9 +13,10 @@ sha1 = "0.10"
 md-5 = "0.10"
 clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
+rayon = "1.10"
 boreal = { version = "1.1.0", features = ["serialize"] }
 iced-x86 = "1.21.0"
-reqwest = { version = "0.13.4", features = ["blocking", "json"] }
+memmap2 = "0.9"
 serde_json = "1.0.150"
 serde = { version = "1.0.228", features = ["derive"] }
 base64 = "0.22.1"

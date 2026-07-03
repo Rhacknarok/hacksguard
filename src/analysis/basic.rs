@@ -3,17 +3,30 @@ use sha2::{Digest, Sha256};
 
 /// Run basic (format-agnostic) analysis: hashes, entropy, strings.
 pub fn analyze(data: &[u8]) -> BasicAnalysis {
-    let md5 = compute_hash::<md5::Md5>(data);
-    let sha1 = compute_hash::<sha1::Sha1>(data);
-    let sha256 = compute_hash::<Sha256>(data);
-    let entropy = shannon_entropy(data);
-    let strings = extract_strings(data, 4);
-    let is_packed = entropy > 7.0;
+    let (((md5, sha1), (sha256, entropy)), (strings, byte_distribution)) = rayon::join(
+        || rayon::join(
+            || rayon::join(
+                || compute_hash::<md5::Md5>(data),
+                || compute_hash::<sha1::Sha1>(data),
+            ),
+            || rayon::join(
+                || compute_hash::<Sha256>(data),
+                || shannon_entropy(data),
+            )
+        ),
+        || rayon::join(
+            || extract_strings(data, 4),
+            || {
+                let mut dist = [0u64; 256];
+                for &b in data {
+                    dist[b as usize] += 1;
+                }
+                dist.to_vec()
+            }
+        )
+    );
 
-    let mut byte_distribution = [0u64; 256];
-    for &b in data {
-        byte_distribution[b as usize] += 1;
-    }
+    let is_packed = entropy > 7.0;
 
     BasicAnalysis {
         md5,
@@ -22,7 +35,7 @@ pub fn analyze(data: &[u8]) -> BasicAnalysis {
         entropy,
         strings,
         is_packed,
-        byte_distribution: byte_distribution.to_vec(),
+        byte_distribution,
     }
 }
 

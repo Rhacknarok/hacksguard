@@ -22,8 +22,6 @@ HacksGuard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis
 
 ## 📦 Installation
 
-
-
 ### Building from source
 
 Make sure you have Rust and Cargo installed, then run:
@@ -33,6 +31,9 @@ git clone https://github.com/your-username/hacksguard.git
 cd hacksguard
 cargo build --release
 ```
+
+The compiled binary will be available at `target/release/hacksguard`.
+
 ### Nixpkgs
 
 For Nix or NixOS users is a [package](https://search.nixos.org/packages?channel=unstable&from=0&size=50&sort=relevance&type=packages&query=hacksguard)
@@ -42,8 +43,6 @@ be present in the ``unstable`` channel.
 ```bash
 $ nix-env -iA nixos.hacksguard
 ```
-
-The compiled binary will be available at `target/release/hacksguard`.
 
 ## 🚀 Usage
 
