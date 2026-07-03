@@ -243,10 +243,6 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(kv_line("Type", &pe_type));
     lines.push(kv_line("Magic", &magic_hex));
 
-    if let Some(vt) = &app.result.vt_score {
-        lines.push(kv_line("VT Score", vt));
-    }
-
 
     if let Some(pe) = &app.result.pe {
         lines.push(Line::from(""));

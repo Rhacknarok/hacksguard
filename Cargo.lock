@@ -155,6 +155,7 @@ checksum = "cd932e254680c20c7b48524f673683da731485e5b9949cd330e932a886fe53ff"
 dependencies = [
  "aho-corasick",
  "boreal-parser",
+ "borsh",
  "codespan-reporting",
  "const-oid",
  "crc32fast",
@@ -181,6 +182,16 @@ checksum = "da4d10dd38417a61546df333b41c727aefafaf41ce329fc0e737b9e9a7406c0c"
 dependencies = [
  "codespan-reporting",
  "nom",
+]
+
+[[package]]
+name = "borsh"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3f6da4992df95bbcd9af42a6c7dcb994498fc9048230405f3b36ff7cd3f145"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
 ]
 
 [[package]]

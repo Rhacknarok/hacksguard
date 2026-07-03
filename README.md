@@ -10,7 +10,7 @@ HacksGuard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis
 
 ## 🌟 Key Features
 
-- **Blazing Fast & Multi-Threaded**: The core analysis pipeline (PE parsing, YARA scanning, VirusTotal queries, and entropy calculation) runs concurrently. This ensures zero UI latency, even when analyzing large executables.
+- **Blazing Fast & Multi-Threaded**: The core analysis pipeline (PE parsing, YARA scanning, and entropy calculation) runs concurrently. This ensures zero UI latency, even when analyzing large executables.
 - **Advanced Risk Scoring**: HacksGuard automatically compiles a 0-100% Risk Score based on 5 heuristic axes (Entropy, Suspicious APIs, PE Anomalies, Strings, and Packing), visualized beautifully through an interactive radar chart.
 - **Integrated YARA Engine**: Powered by the `boreal` crate, HacksGuard dynamically loads local YARA rules (e.g., Elastic protections-artifacts) to detect known threats, packers, and evasion techniques.
 - **Deep PE Inspection**: Comprehensive breakdown of the PE format, including Headers, Sections, Imports (categorized by severity), Exports, Security Mitigations (ASLR, DEP, CFG), and Authenticode verification.
@@ -22,7 +22,7 @@ HacksGuard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis
 
 ## 📦 Installation
 
-To use the VirusTotal features, you will need to set the `VT_API_KEY` environment variable.
+
 
 ### Building from source
 
@@ -67,7 +67,7 @@ cargo run --release -- <path/to/binary.exe>
 - `goblin` - PE/ELF parsing
 - `boreal` - Pure Rust YARA engine
 - `iced-x86` - Disassembler
-- `reqwest` - VirusTotal API client
+
 
 ## 🔗 Related Projects
 
