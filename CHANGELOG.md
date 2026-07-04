@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **YARA Rule Caching**: Implemented a binary caching system (`.yara_cache`) using SHA-256 fingerprinting for YARA rules, eliminating re-compilation overhead and significantly speeding up subsequent program executions.
 - **TUI Loading Screen**: Added a styled progress bar (`Gauge`) displayed during the background analysis phase instead of blocking standard output.
+- **Entropy Graph Enhancements**: Added Y-axis scale (8.0, 4.0, 0.0) and a metadata details panel (global/peak values, peak offset range, warning labels) to the Entropy tab.
+- **Dynamic Graph Color Coding**: Sparkline colors now adjust dynamically based on peak entropy severity.
+- **TUI Demo Recording**: Replaced static screenshot in README with an animated GIF in assets.
+
+### Fixed
+- **Compiler Warnings**: Removed unused `AMBER` color constant in theme.
+
 
 ### Changed
 - **Performance (Data Parallelism)**: Integrated `rayon` to parallelize internal stages of basic analysis. MD5, SHA-1, SHA-256, byte distribution, and string extraction now all compute concurrently on the same memory-mapped buffer.

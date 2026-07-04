@@ -1486,15 +1486,136 @@ fn draw_hexdump(frame: &mut Frame, area: Rect, app: &App) {
 // ─── Entropy tab ─────────────────────────────────────────────────
 
 fn draw_entropy(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::vertical([
+        Constraint::Min(5),
+        Constraint::Length(7),
+    ])
+    .split(area);
+
+    let max_val = app.result.entropy_graph.iter().max().copied().unwrap_or(0);
+    let sparkline_color = if max_val > 750 {
+        theme::CRITICAL
+    } else if max_val > 700 {
+        theme::ORANGE
+    } else if max_val > 650 {
+        theme::WARNING
+    } else {
+        theme::SAFE
+    };
+
+    // Render outer block
+    let graph_block = panel_block("Full File Entropy Graph");
+    let inner_area = graph_block.inner(chunks[0]);
+    frame.render_widget(graph_block, chunks[0]);
+
+    // Split inner area for Y-axis scale and Sparkline
+    let graph_layout = Layout::horizontal([
+        Constraint::Length(6), // Y-axis scale
+        Constraint::Min(0),   // Sparkline
+    ])
+    .split(inner_area);
+
+    let h = graph_layout[0].height as usize;
+    if h >= 3 {
+        let mut scale_lines = vec![Line::raw(""); h];
+        scale_lines[0] = Line::from(Span::styled("8.0 ┐", theme::label()));
+        let mid = h / 2;
+        scale_lines[mid] = Line::from(Span::styled("4.0 ┤", theme::label()));
+        scale_lines[h - 1] = Line::from(Span::styled("0.0 ┘", theme::label()));
+        for i in 0..h {
+            if i != 0 && i != mid && i != h - 1 {
+                scale_lines[i] = Line::from(Span::styled("    │", theme::label()));
+            }
+        }
+        let scale_paragraph = Paragraph::new(scale_lines);
+        frame.render_widget(scale_paragraph, graph_layout[0]);
+    }
+
     let sparkline = ratatui::widgets::Sparkline::default()
-        .block(
-            Block::default()
-                .title(" Full File Entropy Graph ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::BORDER)),
-        )
         .data(&app.result.entropy_graph)
         .max(800)
-        .style(Style::default().fg(theme::ORANGE));
-    frame.render_widget(sparkline, area);
+        .style(Style::default().fg(sparkline_color));
+    frame.render_widget(sparkline, graph_layout[1]);
+
+    // Metadata panel
+    let num_chunks = app.result.entropy_graph.len();
+    let file_size = app.result.file_info.size;
+    let global_entropy = app.result.basic.entropy;
+
+    let mut peak_entropy = 0.0;
+    let mut peak_range = String::from("N/A");
+    if num_chunks > 0 && file_size > 0 {
+        let mut max_idx = 0;
+        let mut local_max = 0;
+        for (i, &val) in app.result.entropy_graph.iter().enumerate() {
+            if val > local_max {
+                local_max = val;
+                max_idx = i;
+            }
+        }
+        peak_entropy = local_max as f64 / 100.0;
+        let chunk_size = (file_size + num_chunks as u64 - 1) / num_chunks as u64;
+        let start_offset = max_idx as u64 * chunk_size;
+        let end_offset = ((max_idx + 1) as u64 * chunk_size).min(file_size);
+        peak_range = format!("{:#x}..{:#x}", start_offset, end_offset);
+    }
+
+    let status_str = if global_entropy > 7.2 {
+        "Highly Packed / Encrypted"
+    } else if global_entropy > 6.8 {
+        "Suspicious (Possible Compression/Packing)"
+    } else {
+        "Normal"
+    };
+
+    let status_color = if global_entropy > 7.2 {
+        theme::CRITICAL
+    } else if global_entropy > 6.8 {
+        theme::WARNING
+    } else {
+        theme::SAFE
+    };
+
+    let threshold_warning = if max_val > 700 {
+        "  ⚠️ High entropy peaks detected (> 7.0). Likely obfuscated, compressed or packed payload."
+    } else {
+        "  ✓ Entropy levels are within normal bounds."
+    };
+    let warning_color = if max_val > 700 {
+        theme::CRITICAL
+    } else {
+        theme::SAFE
+    };
+
+    let info_lines = vec![
+        Line::from(vec![
+            Span::styled("  Global Shannon Entropy:  ", theme::label()),
+            Span::styled(format!("{:.4}", global_entropy), theme::value()),
+            Span::styled("   [", theme::label()),
+            Span::styled(status_str, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled("]", theme::label()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Peak Local Entropy:      ", theme::label()),
+            Span::styled(format!("{:.4}", peak_entropy), theme::value()),
+            Span::styled("  (at offset range: ", theme::label()),
+            Span::styled(peak_range, theme::value()),
+            Span::styled(")", theme::label()),
+        ]),
+        Line::from(vec![
+            Span::styled("  File Size:               ", theme::label()),
+            Span::styled(format!("{} bytes", file_size), theme::value()),
+            Span::styled("  /  Graph Resolution: ", theme::label()),
+            Span::styled(format!("{} chunks", num_chunks), theme::value()),
+        ]),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled(threshold_warning, Style::default().fg(warning_color).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+
+    let info_paragraph = Paragraph::new(info_lines)
+        .block(panel_block("Entropy Analysis Details"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(info_paragraph, chunks[1]);
 }

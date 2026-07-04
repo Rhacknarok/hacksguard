@@ -4,7 +4,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-lightgrey?style=flat-square)
 
-![HacksGuard TUI Malware Analysis Dashboard](assets/screenshot.png)
+![HacksGuard TUI Malware Analysis Dashboard](assets/hacksguard.gif)
 
 HacksGuard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis tool designed for SOC analysts, threat hunters, and reverse engineers. Built entirely in Rust, it provides an intuitive dashboard for quick triage and deep inspection of Portable Executable (PE) files right from your terminal.
 
