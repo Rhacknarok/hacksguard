@@ -1,18 +1,18 @@
-# HacksGuard - Blazing Fast TUI Malware Analysis Tool 🛡️
+# Hacksguard - Blazing Fast TUI Malware Analysis Tool 🛡️
 
 ![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-lightgrey?style=flat-square)
 
-![HacksGuard TUI Malware Analysis Dashboard](assets/hacksguard.gif)
+![Hacksguard TUI Malware Analysis Dashboard](assets/hacksguard.gif)
 
-HacksGuard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis tool designed for SOC analysts, threat hunters, and reverse engineers. Built entirely in Rust, it provides an intuitive dashboard for quick triage and deep inspection of Portable Executable (PE) files right from your terminal.
+Hacksguard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis tool designed for SOC analysts, threat hunters, and reverse engineers. Built entirely in Rust, it provides an intuitive dashboard for quick triage and deep inspection of Portable Executable (PE) files right from your terminal.
 
 ## 🌟 Key Features
 
 - **Blazing Fast & Multi-Threaded**: The core analysis pipeline (PE parsing, YARA scanning, and entropy calculation) runs concurrently. This ensures zero UI latency, even when analyzing large executables.
-- **Advanced Risk Scoring**: HacksGuard automatically compiles a 0-100% Risk Score based on 5 heuristic axes (Entropy, Suspicious APIs, PE Anomalies, Strings, and Packing), visualized beautifully through an interactive radar chart.
-- **Integrated YARA Engine**: Powered by the `boreal` crate, HacksGuard dynamically loads local YARA rules (e.g., Elastic protections-artifacts) to detect known threats, packers, and evasion techniques.
+- **Advanced Risk Scoring**: Hacksguard automatically compiles a 0-100% Risk Score based on 5 heuristic axes (Entropy, Suspicious APIs, PE Anomalies, Strings, and Packing), visualized beautifully through an interactive radar chart.
+- **Integrated YARA Engine**: Powered by the `boreal` crate, Hacksguard dynamically loads local YARA rules (e.g., Elastic protections-artifacts) to detect known threats, packers, and evasion techniques.
 - **Deep PE Inspection**: Comprehensive breakdown of the PE format, including Headers, Sections, Imports (categorized by severity), Exports, Security Mitigations (ASLR, DEP, CFG), and Authenticode verification.
 - **Visual Entropy Graph**: A dedicated Entropy tab plots the Shannon entropy distribution of the file using sparklines, allowing analysts to visually spot encrypted or packed payloads instantly.
 - **Auto-Decoding Strings**: Automatically extracts and categorizes strings (IPs, URLs, Registry keys). Suspicious strings matching the Base64 alphabet are decoded on the fly directly in the interface.
@@ -46,7 +46,7 @@ $ nix-env -iA nixos.hacksguard
 
 ## 🚀 Usage
 
-Run HacksGuard by providing the path to the executable you want to analyze:
+Run Hacksguard by providing the path to the executable you want to analyze:
 
 ```bash
 cargo run --release -- <path/to/binary.exe>
@@ -71,3 +71,32 @@ cargo run --release -- <path/to/binary.exe>
 ## 🔗 Related Projects
 
 - [Elastic Protections Artifacts](https://github.com/elastic/protections-artifacts) - YARA rules
+
+## 📸 Screenshots
+
+### Overview
+![Overview](assets/screenshots/1%20-%20overview.png)
+
+### PE Headers
+![PE Headers](assets/screenshots/2%20-%20headers.png)
+
+### Sections
+![Sections](assets/screenshots/3%20-%20sections.png)
+
+### Imports
+![Imports](assets/screenshots/4%20-%20imports.png)
+
+### Disassembly
+![Disassembly](assets/screenshots/5%20-%20disasm.png)
+
+### Hex View
+![Hex View](assets/screenshots/6%20-%20hex.png)
+
+### Strings
+![Strings](assets/screenshots/7%20-%20strings.png)
+
+### Entropy
+![Entropy](assets/screenshots/8%20-%20entropy.png)
+
+### Analyst Guide
+![Analyst Guide](assets/screenshots/9%20-%20guide.png)
