@@ -1,4 +1,4 @@
-# Hacksguard - Blazing Fast TUI Malware Analysis Tool 🛡️
+# Hacksguard 0.2 - Blazing Fast TUI Malware Analysis Tool 🛡️
 
 ![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
