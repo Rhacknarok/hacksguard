@@ -15,7 +15,6 @@ pub struct AnalysisResult {
     pub detection_checks: Vec<DetectionCheck>,
     pub malware_pattern: Option<MalwarePattern>,
     pub yara_matches: Vec<String>,
-    pub vt_score: Option<String>,
     pub entropy_graph: Vec<u64>,
 }
 

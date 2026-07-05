@@ -8,3 +8,4 @@
 .DS_Store
 .codegraph/
 test_goblin.rs
+.yara_cache

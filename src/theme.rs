@@ -5,7 +5,6 @@ use ratatui::style::{Color, Modifier, Style};
 pub const ORANGE: Color = Color::Rgb(255, 140, 0);
 pub const ORANGE_LIGHT: Color = Color::Rgb(255, 180, 80);
 pub const ORANGE_DARK: Color = Color::Rgb(204, 85, 0);
-pub const AMBER: Color = Color::Rgb(255, 191, 0);
 
 // ─── Severity colours ────────────────────────────────────────────
 

@@ -6,8 +6,10 @@ use color_eyre::Result;
 use std::path::Path;
 
 /// Run the full analysis pipeline on a file.
-pub fn analyze_file(path: &Path) -> Result<AnalysisResult> {
-    let data = std::fs::read(path)?;
+pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>>) -> Result<AnalysisResult> {
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let data = &mmap[..];
 
     let magic: Vec<u8> = data.iter().take(16).copied().collect();
     let file_type = detect_type(&magic);
@@ -23,68 +25,48 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult> {
         magic_bytes: magic,
     };
 
-    let (basic_result, entropy_graph, pe_result, yara_matches, vt_score) = std::thread::scope(|s| {
-        let basic_handle = s.spawn(|| {
-            let b = basic::analyze(&data);
-            let e = compute_entropy_graph(&data, 64);
-            (b, e)
+    let data_ref = &data;
+    let (basic_result, entropy_graph, pe_result, yara_matches) = std::thread::scope(|s| {
+        let tx1 = progress_tx.clone();
+        let basic_handle = s.spawn(move || {
+            let res = basic::analyze(data_ref);
+            if let Some(tx) = &tx1 { let _ = tx.send(()); }
+            res
+        });
+        
+        let tx2 = progress_tx.clone();
+        let entropy_handle = s.spawn(move || {
+            let res = compute_entropy_graph(data_ref, 64);
+            if let Some(tx) = &tx2 { let _ = tx.send(()); }
+            res
         });
 
-        let pe_handle = s.spawn(|| {
-            if file_type == FileType::PE {
-                pe::analyze(&data).ok()
+        let tx3 = progress_tx.clone();
+        let pe_handle = s.spawn(move || {
+            let res = if file_type == FileType::PE {
+                pe::analyze(data_ref).ok()
             } else {
                 None
-            }
-        });
-
-        let yara_handle = s.spawn(|| {
-            let mut yara_matches = Vec::new();
-            let mut compiler = boreal::Compiler::new();
-            if let Ok(entries) = std::fs::read_dir("rules") {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
-                        let _ = compiler.add_rules_file(&path);
-                    }
-                }
-            }
-            let scanner = compiler.finalize();
-            let res = match scanner.scan_mem(&data) {
-                Ok(res) => res,
-                Err((_, res)) => res,
             };
-            yara_matches.extend(res.rules.iter().map(|r| r.name.to_string()));
-            yara_matches
+            if let Some(tx) = &tx3 { let _ = tx.send(()); }
+            res
         });
 
-        let (basic, entropy) = basic_handle.join().unwrap();
-
-        let vt_sha256 = basic.sha256.clone();
-        let vt_handle = s.spawn(move || {
-            let mut vt_score = None;
-            if let Ok(api_key) = std::env::var("VT_API_KEY") {
-                if let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(3)).build() {
-                    let url = format!("https://www.virustotal.com/api/v3/files/{}", vt_sha256);
-                    if let Ok(res) = client.get(&url).header("x-apikey", api_key).send() {
-                        if let Ok(json) = res.json::<serde_json::Value>() {
-                            if let Some(stats) = json["data"]["attributes"]["last_analysis_stats"].as_object() {
-                                let malicious = stats["malicious"].as_u64().unwrap_or(0);
-                                let total = malicious + stats["undetected"].as_u64().unwrap_or(0) + stats["harmless"].as_u64().unwrap_or(0);
-                                vt_score = Some(format!("{}/{}", malicious, total));
-                            }
-                        }
-                    }
-                }
-            }
-            vt_score
+        let tx4 = progress_tx.clone();
+        let yara_handle = s.spawn(move || {
+            let res = load_or_compile_yara(data_ref);
+            if let Some(tx) = &tx4 { let _ = tx.send(()); }
+            res
         });
 
+
+
+        let basic = basic_handle.join().unwrap();
+        let entropy = entropy_handle.join().unwrap();
         let pe = pe_handle.join().unwrap();
         let yara = yara_handle.join().unwrap();
-        let vt = vt_handle.join().unwrap();
 
-        (basic, entropy, pe, yara, vt)
+        (basic, entropy, pe, yara)
     });
 
     let (risk_score, risk_level, risk_breakdown) = compute_risk(&basic_result, &pe_result);
@@ -100,7 +82,6 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult> {
         risk_breakdown,
         detection_checks,
         malware_pattern,
-        vt_score,
         yara_matches,
         entropy_graph,
     })
@@ -111,12 +92,16 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
         return vec![0; num_chunks];
     }
     let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
-    let mut graph = Vec::with_capacity(num_chunks);
-    for chunk in data.chunks(chunk_size) {
-        let entropy = basic::shannon_entropy(chunk);
-        // Scale 0.0-8.0 to 0-800 for better visual resolution
-        graph.push((entropy * 100.0) as u64);
-    }
+    
+    use rayon::prelude::*;
+    let mut graph: Vec<u64> = data.par_chunks(chunk_size)
+        .map(|chunk| {
+            let entropy = basic::shannon_entropy(chunk);
+            // Scale 0.0-8.0 to 0-800 for better visual resolution
+            (entropy * 100.0) as u64
+        })
+        .collect();
+    
     while graph.len() < num_chunks {
         graph.push(0);
     }
@@ -124,6 +109,92 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
 }
 
 // ─── File type detection via magic bytes ─────────────────────────
+
+// ─── YARA persistent cache ───────────────────────────────────────
+
+const YARA_CACHE_PATH: &str = ".yara_cache";
+
+/// Compute a SHA-256 fingerprint over all rule file paths + their contents.
+/// Any change in file names, order, or content will invalidate the cache.
+fn compute_rules_fingerprint() -> Vec<u8> {
+    use sha2::{Sha256, Digest};
+
+    let mut hasher = Sha256::new();
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir("rules") {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
+                paths.push(path);
+            }
+        }
+    }
+    // Sort for deterministic ordering
+    paths.sort();
+
+    for path in &paths {
+        hasher.update(path.to_string_lossy().as_bytes());
+        if let Ok(content) = std::fs::read(path) {
+            hasher.update(&content);
+        }
+    }
+
+    hasher.finalize().to_vec()
+}
+
+/// Load a cached YARA Scanner from disk, or compile from source rules and cache.
+///
+/// Cache format: [32 bytes fingerprint][boreal-serialized Scanner]
+fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
+    let fingerprint = compute_rules_fingerprint();
+
+    // Try loading from cache
+    if let Ok(cache_bytes) = std::fs::read(YARA_CACHE_PATH) {
+        if cache_bytes.len() > 32 && cache_bytes[..32] == fingerprint[..] {
+            let params = boreal::scanner::DeserializeParams::default();
+            if let Ok(scanner) = boreal::scanner::Scanner::from_bytes_unchecked(&cache_bytes[32..], params) {
+                let res = match scanner.scan_mem(data) {
+                    Ok(res) => res,
+                    Err((_, res)) => res,
+                };
+                return res.rules.iter().map(|r| r.name.to_string()).collect();
+            }
+        }
+    }
+
+    // Cache miss or invalid → recompile
+    let mut compiler = boreal::Compiler::new();
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("rules") {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    for path in &paths {
+        let _ = compiler.add_rules_file(path);
+    }
+    let scanner = compiler.finalize();
+
+    // Save cache
+    let mut serialized = Vec::new();
+    if scanner.to_bytes(&mut serialized).is_ok() {
+        let mut cache = Vec::with_capacity(32 + serialized.len());
+        cache.extend_from_slice(&fingerprint);
+        cache.extend_from_slice(&serialized);
+        let _ = std::fs::write(YARA_CACHE_PATH, &cache);
+    }
+
+    let res = match scanner.scan_mem(data) {
+        Ok(res) => res,
+        Err((_, res)) => res,
+    };
+    res.rules.iter().map(|r| r.name.to_string()).collect()
+}
 
 fn detect_type(magic: &[u8]) -> FileType {
     if magic.len() >= 2 && magic[0] == 0x4D && magic[1] == 0x5A {
