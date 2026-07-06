@@ -74,7 +74,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         risk_score = 100;
         risk_level = RiskLevel::Critical;
     }
-    let detection_checks = build_detection_checks(&basic_result, &pe_result);
+    let detection_checks = build_detection_checks(&basic_result, &pe_result, file_info.size);
     let malware_pattern = detect_malware_pattern(&basic_result, &pe_result);
 
     Ok(AnalysisResult {
@@ -297,7 +297,7 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLev
 
 // ─── Detection checks ───────────────────────────────────────────
 
-fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> Vec<DetectionCheck> {
+fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
     let mut checks = Vec::with_capacity(23);
 
     // Helper: check if any string matches a category
@@ -583,6 +583,102 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> Vec
         name: "File paths in strings".into(),
         triggered: has_category(&StringCategory::FilePath),
         severity: DetectionSeverity::Info,
+    });
+
+    // 24. IAT Spoofing / Hidden IAT
+    let iat_spoofing = pe.as_ref().map(|p| {
+        let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
+        let has_dyn_loading = p.imports.iter().any(|dll| {
+            dll.functions.iter().any(|f| {
+                let name = f.name.to_lowercase();
+                name.contains("loadlibrary") || name.contains("getprocaddress") || name.contains("ldrloaddll") || name.contains("ldrgetprocedureaddress")
+            })
+        });
+        
+        let is_suspicious_no_imports = total_imports == 0 && file_size > 15360;
+        let is_suspicious_dyn_loading = total_imports > 0 && total_imports <= 5 && has_dyn_loading && file_size > 15360;
+        
+        is_suspicious_no_imports || is_suspicious_dyn_loading
+    }).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "IAT Spoofing / Hidden IAT".into(),
+        triggered: iat_spoofing,
+        severity: DetectionSeverity::High,
+    });
+
+    // 25. PEB Walking (API Hashing)
+    let peb_walking = pe.as_ref().map(|p| {
+        if p.ep_bytes.is_empty() {
+            return false;
+        }
+        use iced_x86::{Decoder, DecoderOptions, Register};
+        let bitness = if p.is_64bit { 64 } else { 32 };
+        let mut decoder = Decoder::with_ip(bitness, &p.ep_bytes, p.entry_point as u64, DecoderOptions::NONE);
+        let mut instruction = iced_x86::Instruction::default();
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instruction);
+            for i in 0..instruction.op_count() {
+                if instruction.op_kind(i) == iced_x86::OpKind::Memory {
+                    let seg = instruction.memory_segment();
+                    let disp = instruction.memory_displacement64();
+                    if bitness == 32 && seg == Register::FS && disp == 0x30 {
+                        return true;
+                    }
+                    if bitness == 64 && seg == Register::GS && disp == 0x60 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "PEB Walking (API Hashing)".into(),
+        triggered: peb_walking,
+        severity: DetectionSeverity::High,
+    });
+
+    // 26. Selective API Obfuscation
+    let selective_api_obfuscation = pe.as_ref().map(|p| {
+        let has_dyn_loading = p.imports.iter().any(|dll| {
+            dll.functions.iter().any(|f| {
+                let name = f.name.to_lowercase();
+                name.contains("loadlibrary") || name.contains("getprocaddress") || name.contains("ldrloaddll")
+            })
+        });
+
+        if !has_dyn_loading && !peb_walking {
+            return false;
+        }
+
+        let sensitive_apis = [
+            "VirtualAllocEx", "VirtualProtectEx", "WriteProcessMemory", "CreateRemoteThread",
+            "NtCreateThreadEx", "RtlCreateUserThread", "QueueUserAPC", "SetThreadContext",
+            "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess"
+        ];
+
+        let imported_apis: std::collections::HashSet<String> = p.imports.iter()
+            .flat_map(|dll| dll.functions.iter().map(|f| f.name.to_lowercase()))
+            .collect();
+
+        sensitive_apis.iter().any(|&api| {
+            let api_lower = api.to_lowercase();
+            if imported_apis.contains(&api_lower) {
+                return false;
+            }
+            basic.strings.iter().any(|s| {
+                s.value.to_lowercase().contains(&api_lower) || 
+                s.decoded.as_ref().map_or(false, |d| d.to_lowercase().contains(&api_lower))
+            })
+        })
+    }).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "Selective API Obfuscation".into(),
+        triggered: selective_api_obfuscation,
+        severity: DetectionSeverity::High,
     });
 
     checks
