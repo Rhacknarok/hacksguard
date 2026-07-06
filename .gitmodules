@@ -1,0 +1,6 @@
+[submodule "rules/elastic"]
+	path = rules/elastic
+	url = https://github.com/elastic/protections-artifacts.git
+[submodule "rules/signature-base"]
+	path = rules/signature-base
+	url = https://github.com/Neo23x0/signature-base.git

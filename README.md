@@ -12,7 +12,7 @@ Hacksguard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis
 
 - **Blazing Fast & Multi-Threaded**: The core analysis pipeline (PE parsing, YARA scanning, and entropy calculation) runs concurrently. This ensures zero UI latency, even when analyzing large executables.
 - **Advanced Risk Scoring**: Hacksguard automatically compiles a 0-100% Risk Score based on 5 heuristic axes (Entropy, Suspicious APIs, PE Anomalies, Strings, and Packing), visualized beautifully through an interactive radar chart.
-- **Integrated YARA Engine**: Powered by the `boreal` crate, Hacksguard dynamically loads local YARA rules (e.g., Elastic protections-artifacts) to detect known threats, packers, and evasion techniques.
+- **Integrated YARA Engine**: Powered by the `boreal` crate, Hacksguard dynamically loads local YARA rules (e.g., Elastic protections-artifacts and Neo23x0 signature-base) to detect known threats, packers, and evasion techniques.
 - **Deep PE Inspection**: Comprehensive breakdown of the PE format, including Headers, Sections, Imports (categorized by severity), Exports, Security Mitigations (ASLR, DEP, CFG), and Authenticode verification.
 - **Visual Entropy Graph**: A dedicated Entropy tab plots the Shannon entropy distribution of the file using sparklines, allowing analysts to visually spot encrypted or packed payloads instantly.
 - **Auto-Decoding Strings**: Automatically extracts and categorizes strings (IPs, URLs, Registry keys). Suspicious strings matching the Base64 alphabet are decoded on the fly directly in the interface.
@@ -24,11 +24,18 @@ Hacksguard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis
 
 ### Building from source
 
-Make sure you have Rust and Cargo installed, then run:
+Make sure you have Rust and Cargo installed. Clone the repository with its submodules:
 
 ```bash
-git clone https://github.com/Rhacknarok/hacksguard.git
+git clone --recursive https://github.com/Rhacknarok/hacksguard.git
 cd hacksguard
+cargo build --release
+```
+
+If already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
 cargo build --release
 ```
 
@@ -71,6 +78,7 @@ cargo run --release -- <path/to/binary.exe>
 ## 🔗 Related Projects
 
 - [Elastic Protections Artifacts](https://github.com/elastic/protections-artifacts) - YARA rules
+- [Neo23x0 Signature Base](https://github.com/Neo23x0/signature-base) - YARA rules
 
 ## 📸 Screenshots
 

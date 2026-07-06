@@ -114,6 +114,19 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
 
 const YARA_CACHE_PATH: &str = ".yara_cache";
 
+fn visit_dirs(dir: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                visit_dirs(&path, paths);
+            } else if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
+                paths.push(path);
+            }
+        }
+    }
+}
+
 /// Compute a SHA-256 fingerprint over all rule file paths + their contents.
 /// Any change in file names, order, or content will invalidate the cache.
 fn compute_rules_fingerprint() -> Vec<u8> {
@@ -122,14 +135,7 @@ fn compute_rules_fingerprint() -> Vec<u8> {
     let mut hasher = Sha256::new();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir("rules") {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
-                paths.push(path);
-            }
-        }
-    }
+    visit_dirs(std::path::Path::new("rules"), &mut paths);
     // Sort for deterministic ordering
     paths.sort();
 
@@ -166,14 +172,7 @@ fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
     // Cache miss or invalid → recompile
     let mut compiler = boreal::Compiler::new();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("rules") {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
-                paths.push(path);
-            }
-        }
-    }
+    visit_dirs(std::path::Path::new("rules"), &mut paths);
     paths.sort();
     for path in &paths {
         let _ = compiler.add_rules_file(path);
