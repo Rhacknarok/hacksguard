@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.3.0] - Unreleased
 
 ### Added
 - **Git Submodules for YARA rules**: Replaced local YARA rules with `elastic/protections-artifacts` and `Neo23x0/signature-base` repositories as git submodules to easily track latest threat intelligence.
@@ -17,17 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Compiler Warnings**: Removed unused `AMBER` color constant in theme.
+- **TUI Emoji Rendering**: Replaced heavy cross emoji (`✖`) in Critical verdict banner with an ASCII exclamation mark (`!`) to prevent purple emoji fallback rendering on Windows Terminal.
 
 
 ### Changed
-- **YARA Rules Path**: Modified the core analysis scanner to load YARA signatures from `protections-artifacts/yara/rules` instead of local `rules` folder.
+- **YARA Rules Path**: Modified the core analysis scanner to recursively load YARA signatures from the submodules inside `rules/` directory instead of a single local folder.
+- **YARA Matches Risk Override**: Overrode risk score to 100 and level to Critical (displayed as red in UI) if any YARA rule matches.
+- **TUI Section Ordering**: Rearranged the dashboard's right column on the Overview tab to display YARA Analysis at the very top.
+- **Naming Standard**: Renamed all code and UI guide occurrences of HacksGuard to Hacksguard.
+- **Analyst Guide**: Updated in-app documentation to reflect new YARA rule sources.
+
+## [0.2.0] - 2026-07-05
+
+### Changed
 - **Performance (Data Parallelism)**: Integrated `rayon` to parallelize internal stages of basic analysis. MD5, SHA-1, SHA-256, byte distribution, and string extraction now all compute concurrently on the same memory-mapped buffer.
 - **Performance (Parallel Entropy)**: Shannon entropy sparkline graph is now computed in parallel using `rayon::par_chunks`, utilizing all available CPU cores.
 - **Performance (Zero-Copy I/O)**: Replaced `std::fs::read` with `memmap2` for zero-copy file reading. The OS now manages virtual memory paging, allowing all parallel threads to read without loading the entire file into RAM.
 - **Threading Optimization**: Decoupled basic analysis and entropy calculation into separate independent threads to maximize parallel execution.
 - Completely removed VirusTotal integration, API requirements, and `reqwest` dependency.
 
-## [0.1.0] - 2025-07-03
+## [0.1.0] - 2026-07-03
 
 ### Added
 

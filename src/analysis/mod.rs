@@ -69,7 +69,11 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         (basic, entropy, pe, yara)
     });
 
-    let (risk_score, risk_level, risk_breakdown) = compute_risk(&basic_result, &pe_result);
+    let (mut risk_score, mut risk_level, risk_breakdown) = compute_risk(&basic_result, &pe_result);
+    if !yara_matches.is_empty() {
+        risk_score = 100;
+        risk_level = RiskLevel::Critical;
+    }
     let detection_checks = build_detection_checks(&basic_result, &pe_result);
     let malware_pattern = detect_malware_pattern(&basic_result, &pe_result);
 

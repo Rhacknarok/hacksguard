@@ -143,7 +143,7 @@ fn draw_verdict_banner(frame: &mut Frame, area: Rect, app: &App) {
         RiskLevel::Low => ("◆", "LOW RISK — Minor indicators found"),
         RiskLevel::Medium => ("▲", "MEDIUM RISK — Suspicious indicators present"),
         RiskLevel::High => ("⚠", "HIGH RISK — Multiple threat indicators"),
-        RiskLevel::Critical => ("✖", "CRITICAL — Strong malware indicators detected"),
+        RiskLevel::Critical => ("!", "CRITICAL — Strong malware indicators detected"),
     };
 
     let line = Line::from(vec![
@@ -193,12 +193,12 @@ fn draw_overview_body(frame: &mut Frame, area: Rect, app: &App) {
     build_detection_ratio_lines(&mut left_lines, app);
     build_packer_lines(&mut left_lines, app);
 
+    build_yara_lines(&mut right_lines, app);
     build_entropy_histogram_lines(&mut right_lines, app);
     build_byte_distribution_lines(&mut right_lines, app);
     build_import_heatmap_lines(&mut right_lines, app);
     build_suspicious_strings_lines(&mut right_lines, app);
     build_malware_pattern_lines(&mut right_lines, app);
-    build_yara_lines(&mut right_lines, app);
     build_anomalies_lines(&mut right_lines, app);
 
     frame.render_widget(
@@ -765,7 +765,6 @@ fn build_malware_pattern_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 }
 
 fn build_yara_lines(lines: &mut Vec<Line<'static>>, app: &App) {
-    lines.push(Line::from(""));
     lines.push(section_header("YARA Analysis"));
 
     if app.result.yara_matches.is_empty() {
@@ -783,6 +782,7 @@ fn build_yara_lines(lines: &mut Vec<Line<'static>>, app: &App) {
             ]));
         }
     }
+    lines.push(Line::from(""));
 }
 
 fn build_anomalies_lines(lines: &mut Vec<Line<'static>>, app: &App) {
@@ -1297,7 +1297,7 @@ fn draw_guide(frame: &mut Frame, area: Rect, app: &App) {
     
     // Main Title
     lines.push(Line::from(vec![
-        Span::styled(" HacksGuard Analyst Guide ", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
+        Span::styled(" Hacksguard Analyst Guide ", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
     ]));
     lines.push(Line::from(""));
 
@@ -1326,7 +1326,7 @@ fn draw_guide(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(vec![Span::styled("A 'packer' compresses or encrypts the executable to prevent static analysis.", Style::default().fg(theme::TEXT))]));
     lines.push(Line::from(vec![Span::styled(" • UPX / MPRESS : ", theme::label()), Span::styled("Common packers, sometimes legitimate, but often abused.", theme::WARNING)]));
     lines.push(Line::from(vec![Span::styled(" • Themida / VMProtect : ", theme::label()), Span::styled("Extremely powerful commercial obfuscation tools. High risk.", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled("YARA : ", theme::label()), Span::styled("HacksGuard uses the Elastic protections-artifacts YARA rules to detect specific malware families and behaviors.", theme::value())]));
+    lines.push(Line::from(vec![Span::styled("YARA : ", theme::label()), Span::styled("Hacksguard uses Elastic protections-artifacts and Neo23x0 signature-base YARA rules to detect specific malware families and behaviors.", theme::value())]));
     lines.push(Line::from(""));
 
     // 4. Imports & APIs
@@ -1351,7 +1351,7 @@ fn draw_guide(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(vec![Span::styled("Raw text extracted from the file often reveals the author's intent.", Style::default().fg(theme::TEXT))]));
     lines.push(Line::from(vec![Span::styled(" • URLs & IPs : ", theme::label()), Span::styled("Command & Control (C2) servers or download addresses (Droppers).", theme::CRITICAL)]));
     lines.push(Line::from(vec![Span::styled(" • Commands : ", theme::label()), Span::styled("Stealth execution via 'cmd.exe /c', 'powershell -enc', 'vssadmin delete shadows'.", theme::CRITICAL)]));
-    lines.push(Line::from(vec![Span::styled(" • Base64 Decoding : ", theme::label()), Span::styled("HacksGuard automatically attempts to decode strings longer than 16 characters that match the Base64 alphabet.", theme::value())]));
+    lines.push(Line::from(vec![Span::styled(" • Base64 Decoding : ", theme::label()), Span::styled("Hacksguard automatically attempts to decode strings longer than 16 characters that match the Base64 alphabet.", theme::value())]));
     lines.push(Line::from(""));
 
     // 7. Malware Patterns
