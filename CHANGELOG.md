@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Entropy Graph Enhancements**: Added Y-axis scale (8.0, 4.0, 0.0) and a metadata details panel (global/peak values, peak offset range, warning labels) to the Entropy tab.
 - **Dynamic Graph Color Coding**: Sparkline colors now adjust dynamically based on peak entropy severity.
 - **TUI Demo Recording**: Replaced static screenshot in README with an animated GIF in assets.
+- **Advanced PE Evasion Detection**: Implemented three new high-fidelity detection checks:
+  - **IAT Spoofing / Hidden IAT**: Detects executables attempting to hide imports by dynamically loading libraries with minimal/no static imports.
+  - **PEB Walking (API Hashing)**: Scans entry point disassembly via `iced-x86` for segment-relative accesses (`FS:[0x30]` or `GS:[0x60]`) to locate the Process Environment Block.
+  - **Selective API Obfuscation**: Detects executables referencing sensitive process injection or anti-debugging APIs in strings without importing them statically.
 
 ### Fixed
 - **Compiler Warnings**: Removed unused `AMBER` color constant in theme.
