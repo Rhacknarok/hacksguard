@@ -69,12 +69,76 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         (basic, entropy, pe, yara)
     });
 
-    let (mut risk_score, mut risk_level, risk_breakdown) = compute_risk(&basic_result, &pe_result);
-    if !yara_matches.is_empty() {
-        risk_score = 100;
-        risk_level = RiskLevel::Critical;
+    let mut pe_result = pe_result;
+    if let Some(ref mut pe) = pe_result {
+        let has_dyn_loading = pe.imports.iter().any(|dll| {
+            dll.functions.iter().any(|f| {
+                let name = f.name.to_lowercase();
+                name.contains("loadlibrary") || name.contains("getprocaddress") || name.contains("ldrloaddll")
+            })
+        });
+
+        let peb_walking = if pe.ep_bytes.is_empty() {
+            false
+        } else {
+            use iced_x86::{Decoder, DecoderOptions, Register};
+            let bitness = if pe.is_64bit { 64 } else { 32 };
+            let mut decoder = Decoder::with_ip(bitness, &pe.ep_bytes, pe.entry_point as u64, DecoderOptions::NONE);
+            let mut instruction = iced_x86::Instruction::default();
+            let mut found = false;
+            while decoder.can_decode() {
+                decoder.decode_out(&mut instruction);
+                for i in 0..instruction.op_count() {
+                    if instruction.op_kind(i) == iced_x86::OpKind::Memory {
+                        let seg = instruction.memory_segment();
+                        let disp = instruction.memory_displacement64();
+                        if bitness == 32 && seg == Register::FS && disp == 0x30 {
+                            found = true;
+                            break;
+                        }
+                        if bitness == 64 && seg == Register::GS && disp == 0x60 {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found { break; }
+            }
+            found
+        };
+
+        if has_dyn_loading || peb_walking {
+            let sensitive_apis = [
+                "VirtualAllocEx", "VirtualProtectEx", "WriteProcessMemory", "CreateRemoteThread",
+                "NtCreateThreadEx", "RtlCreateUserThread", "QueueUserAPC", "SetThreadContext",
+                "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess"
+            ];
+
+            let imported_apis: std::collections::HashSet<String> = pe.imports.iter()
+                .flat_map(|dll| dll.functions.iter().map(|f| f.name.to_lowercase()))
+                .collect();
+
+            let mut obfuscated = Vec::new();
+            for &api in &sensitive_apis {
+                let api_lower = api.to_lowercase();
+                if imported_apis.contains(&api_lower) {
+                    continue;
+                }
+                let in_strings = basic_result.strings.iter().any(|s| {
+                    s.value.to_lowercase().contains(&api_lower) || 
+                    s.decoded.as_ref().map_or(false, |d| d.to_lowercase().contains(&api_lower))
+                });
+                if in_strings {
+                    obfuscated.push(api.to_string());
+                }
+            }
+            pe.obfuscated_apis = obfuscated;
+        }
     }
+
     let detection_checks = build_detection_checks(&basic_result, &pe_result, file_info.size);
+    let (risk_score, risk_level) = compute_risk_from_checks(&detection_checks, &yara_matches);
+    let (_, _, risk_breakdown) = compute_risk(&basic_result, &pe_result);
     let malware_pattern = detect_malware_pattern(&basic_result, &pe_result);
 
     Ok(AnalysisResult {
@@ -217,6 +281,52 @@ fn detect_type(magic: &[u8]) -> FileType {
 }
 
 // ─── Risk scoring ────────────────────────────────────────────────
+
+fn compute_risk_from_checks(checks: &[DetectionCheck], yara_matches: &[String]) -> (u32, RiskLevel) {
+    let mut score = 0;
+    
+    // Add points for triggered checks
+    for check in checks {
+        if check.triggered {
+            match check.severity {
+                DetectionSeverity::Critical => score += 35,
+                DetectionSeverity::High => score += 20,
+                DetectionSeverity::Medium => score += 10,
+                DetectionSeverity::Low => score += 5,
+                DetectionSeverity::Info => {}
+            }
+        }
+    }
+    
+    // Add points for YARA matches
+    for rule in yara_matches {
+        match yara_severity(rule) {
+            DetectionSeverity::Critical => {
+                score = 100;
+            }
+            DetectionSeverity::High => {
+                score += 40;
+            }
+            DetectionSeverity::Medium => {
+                score += 20;
+            }
+            _ => {
+                score += 10;
+            }
+        }
+    }
+    
+    let score = score.min(100);
+    let level = match score {
+        0..=20 => RiskLevel::Clean,
+        21..=40 => RiskLevel::Low,
+        41..=60 => RiskLevel::Medium,
+        61..=80 => RiskLevel::High,
+        _ => RiskLevel::Critical,
+    };
+    
+    (score, level)
+}
 
 fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLevel, RiskBreakdown) {
     let mut score: u32 = 0;
@@ -862,4 +972,18 @@ fn detect_malware_pattern(
     }
 
     None
+}
+
+fn yara_severity(rule_name: &str) -> DetectionSeverity {
+    let lower = rule_name.to_lowercase();
+    let critical_keywords = ["malware", "trojan", "backdoor", "ransomware", "exploit", "keylogger", "stealer", "apt", "webshell", "rootkit", "bypass"];
+    let high_keywords = ["hacktool", "agent", "rat", "bot", "injector", "execution", "defense_evasion", "credential_access"];
+    
+    if critical_keywords.iter().any(|&k| lower.contains(k)) {
+        DetectionSeverity::Critical
+    } else if high_keywords.iter().any(|&k| lower.contains(k)) {
+        DetectionSeverity::High
+    } else {
+        DetectionSeverity::Medium
+    }
 }

@@ -1074,6 +1074,31 @@ fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
     ]));
     lines.push(Line::from(""));
 
+    // Obfuscated / Dynamically Resolved APIs
+    if !pe.obfuscated_apis.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " ⚠  Obfuscated / Dynamically Resolved APIs (Suspicious)",
+                Style::default()
+                    .fg(theme::CRITICAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for api in &pe.obfuscated_apis {
+            lines.push(Line::from(vec![
+                Span::styled("    ◉ ", Style::default().fg(theme::CRITICAL)),
+                Span::styled(api, Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    " [Obfuscated]",
+                    Style::default()
+                        .fg(theme::CRITICAL)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
     // Per-DLL listing
     for dll in &pe.imports {
         lines.push(Line::from(vec![

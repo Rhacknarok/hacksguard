@@ -324,6 +324,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         ep_bytes,
         overlay_offset,
         overlay_size,
+        obfuscated_apis: Vec::new(),
     })
 }
 
