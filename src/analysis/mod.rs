@@ -6,7 +6,7 @@ use color_eyre::Result;
 use std::path::Path;
 
 /// Run the full analysis pipeline on a file.
-pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>>) -> Result<AnalysisResult> {
+pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>>, run_yara: bool) -> Result<AnalysisResult> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let data = &mmap[..];
@@ -52,19 +52,25 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
             res
         });
 
-        let tx4 = progress_tx.clone();
-        let yara_handle = s.spawn(move || {
-            let res = load_or_compile_yara(data_ref);
-            if let Some(tx) = &tx4 { let _ = tx.send(()); }
-            res
-        });
-
-
+        let yara_handle = if run_yara {
+            let tx4 = progress_tx.clone();
+            Some(s.spawn(move || {
+                let res = load_or_compile_yara(data_ref);
+                if let Some(tx) = &tx4 { let _ = tx.send(()); }
+                res
+            }))
+        } else {
+            None
+        };
 
         let basic = basic_handle.join().unwrap();
         let entropy = entropy_handle.join().unwrap();
         let pe = pe_handle.join().unwrap();
-        let yara = yara_handle.join().unwrap();
+        let yara = if let Some(h) = yara_handle {
+            h.join().unwrap()
+        } else {
+            Vec::new()
+        };
 
         (basic, entropy, pe, yara)
     });
@@ -209,8 +215,14 @@ fn compute_rules_fingerprint() -> Vec<u8> {
 
     for path in &paths {
         hasher.update(path.to_string_lossy().as_bytes());
-        if let Ok(content) = std::fs::read(path) {
-            hasher.update(&content);
+        if let Ok(meta) = std::fs::metadata(path) {
+            hasher.update(&meta.len().to_le_bytes());
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(dur) = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                    hasher.update(&dur.as_secs().to_le_bytes());
+                    hasher.update(&dur.subsec_nanos().to_le_bytes());
+                }
+            }
         }
     }
 
@@ -220,7 +232,7 @@ fn compute_rules_fingerprint() -> Vec<u8> {
 /// Load a cached YARA Scanner from disk, or compile from source rules and cache.
 ///
 /// Cache format: [32 bytes fingerprint][boreal-serialized Scanner]
-fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
+pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
     let fingerprint = compute_rules_fingerprint();
 
     // Try loading from cache
@@ -282,7 +294,7 @@ fn detect_type(magic: &[u8]) -> FileType {
 
 // ─── Risk scoring ────────────────────────────────────────────────
 
-fn compute_risk_from_checks(checks: &[DetectionCheck], yara_matches: &[String]) -> (u32, RiskLevel) {
+pub fn compute_risk_from_checks(checks: &[DetectionCheck], yara_matches: &[String]) -> (u32, RiskLevel) {
     let mut score = 0;
     
     // Add points for triggered checks

@@ -12,6 +12,9 @@ pub struct App {
     pub scroll_offset: u16,
     pub should_quit: bool,
     pub tab_names: Vec<String>,
+    pub yara_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    pub yara_loading: bool,
+    pub spinner_tick: u32,
 }
 
 impl App {
@@ -34,14 +37,35 @@ impl App {
             scroll_offset: 0,
             should_quit: false,
             tab_names,
+            yara_rx: None,
+            yara_loading: false,
+            spinner_tick: 0,
         }
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            if self.yara_loading {
+                if let Some(ref rx) = self.yara_rx {
+                    if let Ok(matches) = rx.try_recv() {
+                        self.yara_loading = false;
+                        self.result.yara_matches = matches;
+                        
+                        // Recompute risk score and level dynamically
+                        let (score, level) = crate::analysis::compute_risk_from_checks(
+                            &self.result.detection_checks,
+                            &self.result.yara_matches,
+                        );
+                        self.result.risk_score = score;
+                        self.result.risk_level = level;
+                    }
+                }
+                self.spinner_tick = self.spinner_tick.wrapping_add(1);
+            }
+
             terminal.draw(|f| ui::draw(f, self))?;
 
-            if event::poll(Duration::from_millis(100))? {
+            if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
                         continue;

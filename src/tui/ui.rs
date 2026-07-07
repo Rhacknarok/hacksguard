@@ -767,7 +767,13 @@ fn build_malware_pattern_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 fn build_yara_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(section_header("YARA Analysis"));
 
-    if app.result.yara_matches.is_empty() {
+    if app.yara_loading {
+        let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let idx = (app.spinner_tick as usize) % spinners.len();
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} Scanning with YARA...", spinners[idx]), Style::default().fg(theme::ORANGE)),
+        ]));
+    } else if app.result.yara_matches.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(" No YARA rules matched", theme::label()),
         ]));

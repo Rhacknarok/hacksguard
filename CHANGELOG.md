@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- **Asynchronous YARA Scanning**: Offloaded YARA rule scanning to a background thread, launching the TUI dashboard immediately once basic analysis is complete rather than blocking on the rule engine.
+- **TUI YARA Spinner**: Added an animated Unicode braille spinner to the YARA panel in the TUI indicating scan progress in real-time, dynamically updating the global risk score upon scan completion.
+- **Optimized YARA Cache Fingerprinting**: Shifted cache verification from full file content hashing to metadata (size, mtime) validation, accelerating startup speed on large rulesets.
+- **Jemalloc Integration (Linux)**: Added target-gated `tikv-jemallocator` as the global allocator on Linux to optimize heap performance during YARA scanning.
 - **YARA Rules Path**: Modified the core analysis scanner to recursively load YARA signatures from the submodules inside `rules/` directory instead of a single local folder.
 - **YARA Matches Risk Override**: Overrode risk score to 100 and level to Critical (displayed as red in UI) if any YARA rule matches.
 - **TUI Section Ordering**: Rearranged the dashboard's right column on the Overview tab to display YARA Analysis at the very top.
