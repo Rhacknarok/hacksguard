@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - Unreleased
 
 ### Added
+- **Nested PE / Overlay Executable Scan**: Implemented generic detection and extraction of embedded PE binaries in raw payloads and overlays, running in a parallel background thread.
+- **TUI Embedded PE View Toggle**: Added a toggle button (`e` key) in the TUI to switch dynamic analysis tabs (Headers, Sections, Imports, Disasm) between the parent PE and the extracted embedded PE payload.
 - **Git Submodules for YARA rules**: Replaced local YARA rules with `elastic/protections-artifacts` and `Neo23x0/signature-base` repositories as git submodules to easily track latest threat intelligence.
 - **YARA Rule Caching**: Implemented a binary caching system (`.yara_cache`) using SHA-256 fingerprinting for YARA rules, eliminating re-compilation overhead and significantly speeding up subsequent program executions.
 - **TUI Loading Screen**: Added a styled progress bar (`Gauge`) displayed during the background analysis phase instead of blocking standard output.

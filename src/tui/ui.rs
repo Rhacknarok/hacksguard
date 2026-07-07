@@ -46,7 +46,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 // ─── Title bar ───────────────────────────────────────────────────
 
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled("  ◆ ", Style::default().fg(theme::ORANGE)),
         Span::styled(
             "HACKSGUARD",
@@ -63,7 +63,16 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
             format!("  ({})", format_size(app.result.file_info.size)),
             Style::default().fg(theme::TEXT_DIM),
         ),
-    ]);
+    ];
+
+    if app.inspect_embedded {
+        spans.push(Span::styled(
+            "  [EMBEDDED PE VIEW]",
+            Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let title = Line::from(spans);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -103,17 +112,25 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
 // ─── Status bar ──────────────────────────────────────────────────
 
-fn draw_status_bar(frame: &mut Frame, area: Rect, _app: &App) {
-    let help = Line::from(vec![
+fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![
         Span::styled(" ←/→ ", Style::default().fg(theme::ORANGE)),
         Span::styled("Tab  ", Style::default().fg(theme::TEXT_DIM)),
         Span::styled("↑/↓ ", Style::default().fg(theme::ORANGE)),
         Span::styled("Scroll  ", Style::default().fg(theme::TEXT_DIM)),
         Span::styled("Home ", Style::default().fg(theme::ORANGE)),
         Span::styled("Top  ", Style::default().fg(theme::TEXT_DIM)),
-        Span::styled("q ", Style::default().fg(theme::ORANGE)),
-        Span::styled("Quit", Style::default().fg(theme::TEXT_DIM)),
-    ]);
+    ];
+
+    if app.result.pe.as_ref().map_or(false, |pe| pe.embedded_pe.is_some()) {
+        spans.push(Span::styled("e ", Style::default().fg(theme::ORANGE)));
+        spans.push(Span::styled("Toggle PE  ", Style::default().fg(theme::TEXT_DIM)));
+    }
+
+    spans.push(Span::styled("q ", Style::default().fg(theme::ORANGE)));
+    spans.push(Span::styled("Quit", Style::default().fg(theme::TEXT_DIM)));
+
+    let help = Line::from(spans);
     frame.render_widget(
         Paragraph::new(help).style(Style::default().bg(theme::BG_PANEL)),
         area,
@@ -194,6 +211,7 @@ fn draw_overview_body(frame: &mut Frame, area: Rect, app: &App) {
     build_packer_lines(&mut left_lines, app);
 
     build_yara_lines(&mut right_lines, app);
+    build_embedded_pe_lines(&mut right_lines, app);
     build_entropy_histogram_lines(&mut right_lines, app);
     build_byte_distribution_lines(&mut right_lines, app);
     build_import_heatmap_lines(&mut right_lines, app);
@@ -218,7 +236,7 @@ fn draw_overview_body(frame: &mut Frame, area: Rect, app: &App) {
 
 fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     let info = &app.result.file_info;
-    let pe_type = if let Some(pe) = &app.result.pe {
+    let pe_type = if let Some(pe) = app.current_pe() {
         let arch = if pe.is_64bit { "PE32+" } else { "PE32" };
         let kind = if pe.is_dll { "DLL" } else { "EXE" };
         format!("{} {} ({})", arch, kind, pe.machine)
@@ -244,7 +262,7 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(kv_line("Magic", &magic_hex));
 
 
-    if let Some(pe) = &app.result.pe {
+    if let Some(pe) = app.current_pe() {
         lines.push(Line::from(""));
         lines.push(section_header("PE Metadata"));
         lines.push(kv_line("Authenticode", if pe.has_authenticode { "✅" } else { "❌" }));
@@ -430,7 +448,7 @@ fn build_detection_ratio_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 
 fn build_packer_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(section_header("Packer Detection"));
-    if let Some(pe) = &app.result.pe {
+    if let Some(pe) = app.current_pe() {
         if let Some(packer) = &pe.packer_detected {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -471,7 +489,7 @@ fn build_packer_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 }
 
 fn build_entropy_histogram_lines(lines: &mut Vec<Line<'static>>, app: &App) {
-    if let Some(pe) = &app.result.pe {
+    if let Some(pe) = app.current_pe() {
         lines.push(section_header("Entropy by Section"));
 
         let bar_w = 25usize;
@@ -571,7 +589,7 @@ fn build_byte_distribution_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 }
 
 fn build_import_heatmap_lines(lines: &mut Vec<Line<'static>>, app: &App) {
-    if let Some(pe) = &app.result.pe {
+    if let Some(pe) = app.current_pe() {
         if !pe.imports.is_empty() {
             lines.push(section_header("Import Risk Map"));
 
@@ -791,8 +809,65 @@ fn build_yara_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(Line::from(""));
 }
 
+fn build_embedded_pe_lines(lines: &mut Vec<Line<'static>>, app: &App) {
+    lines.push(section_header("Embedded Executable Scan"));
+
+    if app.embedded_pe_loading {
+        let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let idx = (app.spinner_tick as usize) % spinners.len();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} Scanning for embedded PE...", spinners[idx]),
+                Style::default().fg(theme::ORANGE),
+            ),
+        ]));
+    } else {
+        let mut found = false;
+        if let Some(pe) = &app.result.pe {
+            if let Some(ref embedded) = pe.embedded_pe {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", theme::label()),
+                    Span::styled(
+                        format!(
+                            "Embedded PE found in overlay (EP: {:#X}, {} sections)",
+                            embedded.entry_point,
+                            embedded.sections.len()
+                        ),
+                        Style::default().fg(theme::WARNING),
+                    ),
+                ]));
+                found = true;
+            }
+        }
+
+        if !found && app.result.file_info.file_type != FileType::PE && app.result.pe.is_some() {
+            if let Some(pe) = &app.result.pe {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", theme::label()),
+                    Span::styled(
+                        format!(
+                            "Embedded PE extracted & analyzed (EP: {:#X}, {} sections)",
+                            pe.entry_point,
+                            pe.sections.len()
+                        ),
+                        Style::default().fg(theme::WARNING),
+                    ),
+                ]));
+                found = true;
+            }
+        }
+
+        if !found {
+            lines.push(Line::from(vec![
+                Span::styled(" No embedded PE found", theme::label()),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+}
+
 fn build_anomalies_lines(lines: &mut Vec<Line<'static>>, app: &App) {
-    if let Some(pe) = &app.result.pe {
+    if let Some(pe) = app.current_pe() {
         if !pe.anomalies.is_empty() {
             lines.push(section_header("Anomalies"));
             for a in &pe.anomalies {
@@ -818,7 +893,7 @@ fn build_anomalies_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 // ─── Headers tab ─────────────────────────────────────────────────
 
 fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(pe) = &app.result.pe else {
+    let Some(pe) = app.current_pe() else {
         frame.render_widget(Paragraph::new(" No PE headers"), area);
         return;
     };
@@ -969,7 +1044,7 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
 // ─── Sections tab ────────────────────────────────────────────────
 
 fn draw_sections(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(pe) = &app.result.pe else {
+    let Some(pe) = app.current_pe() else {
         frame.render_widget(Paragraph::new(" No sections"), area);
         return;
     };
@@ -1041,7 +1116,7 @@ fn draw_sections(frame: &mut Frame, area: Rect, app: &App) {
 // ─── Imports tab ─────────────────────────────────────────────────
 
 fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(pe) = &app.result.pe else {
+    let Some(pe) = app.current_pe() else {
         frame.render_widget(Paragraph::new(" No imports"), area);
         return;
     };
@@ -1406,7 +1481,7 @@ fn draw_guide(frame: &mut Frame, area: Rect, app: &App) {
 // ─── Disasm tab ──────────────────────────────────────────────────
 
 fn draw_disasm(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(pe) = &app.result.pe else {
+    let Some(pe) = app.current_pe() else {
         frame.render_widget(Paragraph::new(" No PE metadata for disassembly"), area);
         return;
     };

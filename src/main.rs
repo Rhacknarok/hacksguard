@@ -35,7 +35,29 @@ fn main() -> Result<()> {
     }
 
     if cli.json {
-        let result = analysis::analyze_file(&cli.file, None, true)?;
+        let mut result = analysis::analyze_file(&cli.file, None, true)?;
+        let data = std::fs::read(&cli.file).unwrap_or_default();
+        let parent_is_pe = result.pe.is_some();
+        if let Some(pe) = analysis::find_embedded_pe(&data, parent_is_pe) {
+            result.detection_checks.push(crate::models::DetectionCheck {
+                name: "Embedded PE executable found".into(),
+                triggered: true,
+                severity: crate::models::DetectionSeverity::Critical,
+            });
+
+            if result.pe.is_some() {
+                result.pe.as_mut().unwrap().embedded_pe = Some(Box::new(pe));
+            } else {
+                result.pe = Some(pe);
+            }
+
+            let (score, level) = crate::analysis::compute_risk_from_checks(
+                &result.detection_checks,
+                &result.yara_matches,
+            );
+            result.risk_score = score;
+            result.risk_level = level;
+        }
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -118,6 +140,18 @@ fn main() -> Result<()> {
 
     app.yara_rx = Some(yara_rx);
     app.yara_loading = true;
+
+    let (ep_tx, ep_rx) = std::sync::mpsc::channel();
+    let ep_file_path = cli.file.clone();
+    let parent_is_pe = app.result.pe.is_some();
+    std::thread::spawn(move || {
+        let data = std::fs::read(&ep_file_path).unwrap_or_default();
+        let res = analysis::find_embedded_pe(&data, parent_is_pe);
+        let _ = ep_tx.send(res);
+    });
+
+    app.embedded_pe_rx = Some(ep_rx);
+    app.embedded_pe_loading = true;
 
     let res = app.run(&mut terminal);
     tui::restore();

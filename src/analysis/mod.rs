@@ -999,3 +999,7 @@ fn yara_severity(rule_name: &str) -> DetectionSeverity {
         DetectionSeverity::Medium
     }
 }
+
+pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
+    pe::find_embedded_pe(data, parent_is_pe)
+}

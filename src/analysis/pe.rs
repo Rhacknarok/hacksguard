@@ -325,6 +325,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         overlay_offset,
         overlay_size,
         obfuscated_apis: Vec::new(),
+        embedded_pe: None,
     })
 }
 
@@ -533,4 +534,78 @@ fn is_timestamp_suspicious(timestamp: u32) -> bool {
     }
 
     false
+}
+
+// ─── Find embedded PE ────────────────────────────────────────────
+
+pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
+    let start_offset = if parent_is_pe { 64 } else { 0 };
+    if data.len() < start_offset + 64 {
+        return None;
+    }
+
+    let mut offset = start_offset;
+    while offset + 64 <= data.len() {
+        if data[offset] == 0x4D && data[offset + 1] == 0x5A { // 'MZ'
+            let e_lfanew = u32::from_le_bytes([
+                data[offset + 0x3C],
+                data[offset + 0x3D],
+                data[offset + 0x3E],
+                data[offset + 0x3F],
+            ]) as usize;
+
+            if e_lfanew > 0 && offset + e_lfanew + 4 <= data.len() {
+                if data[offset + e_lfanew] == 0x50
+                    && data[offset + e_lfanew + 1] == 0x45
+                    && data[offset + e_lfanew + 2] == 0x00
+                    && data[offset + e_lfanew + 3] == 0x00
+                {
+                    if let Ok(pe_analysis) = analyze(&data[offset..]) {
+                        return Some(pe_analysis);
+                    }
+                }
+            }
+        }
+        offset += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn find_any_exe<P: AsRef<Path>>(dir: P) -> Option<std::path::PathBuf> {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(exe) = find_any_exe(&path) {
+                        return Some(exe);
+                    }
+                } else if path.extension().map_or(false, |ext| ext == "exe") {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_find_embedded_pe() {
+        if let Some(exe_path) = find_any_exe("target") {
+            if let Ok(pe_data) = fs::read(exe_path) {
+                let mut dummy = vec![0x90; 100];
+                dummy.extend_from_slice(&pe_data);
+                dummy.extend_from_slice(&[0x90; 100]);
+
+                let found = find_embedded_pe(&dummy, false);
+                assert!(found.is_some());
+                let pe = found.unwrap();
+                assert!(!pe.sections.is_empty());
+            }
+        }
+    }
 }

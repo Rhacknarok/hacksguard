@@ -125,6 +125,7 @@ pub struct PeAnalysis {
     pub overlay_offset: Option<usize>,
     pub overlay_size: Option<usize>,
     pub obfuscated_apis: Vec<String>,
+    pub embedded_pe: Option<Box<PeAnalysis>>,
 }
 
 #[derive(serde::Serialize)]
