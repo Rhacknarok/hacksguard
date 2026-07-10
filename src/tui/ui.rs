@@ -990,6 +990,24 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
     center_lines.push(fmt_mitigation("DEP ", dep));
     center_lines.push(fmt_mitigation("CFG ", cfg));
 
+    center_lines.push(Line::from(""));
+    center_lines.push(section_header("System Calls"));
+    
+    let fmt_syscall = |name: &str, detected: bool| {
+        let (icon, color) = if detected {
+            ("⚠  DETECTED", theme::CRITICAL)
+        } else {
+            ("NOT FOUND", theme::SAFE)
+        };
+        Line::from(vec![
+            Span::styled(format!("  {:<9} ", name), theme::label()),
+            Span::styled(icon.to_string(), Style::default().fg(color)),
+        ])
+    };
+
+    center_lines.push(fmt_syscall("Direct", pe.direct_syscalls));
+    center_lines.push(fmt_syscall("Indirect", pe.indirect_syscalls));
+
     if !pe.exports.is_empty() {
         center_lines.push(Line::from(""));
         center_lines.push(section_header("Exports"));
@@ -1494,6 +1512,27 @@ fn draw_disasm(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let mut lines = Vec::new();
+
+    if !pe.syscall_locations.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" Detected System Call Instructions ", Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(""));
+        for loc in &pe.syscall_locations {
+            let type_str = if loc.is_indirect { "Indirect" } else { "Direct" };
+            let type_color = theme::CRITICAL;
+            lines.push(Line::from(vec![
+                Span::styled("  Address: ", Style::default().fg(theme::TEXT_DIM)),
+                Span::styled(format!("{:#010x}", loc.address), Style::default().fg(theme::INFO)),
+                Span::styled(format!("  [{}]  ", type_str), Style::default().fg(type_color).add_modifier(Modifier::BOLD)),
+                Span::styled(&loc.instruction_str, Style::default().fg(theme::TEXT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(" ────────────────────────────────────────────────────────────────────────", Style::default().fg(theme::TEXT_DIM))));
+        lines.push(Line::from(""));
+    }
+
     lines.push(Line::from(vec![
         Span::styled(format!(" Disassembly at Entry Point ({:#010x}) ", pe.entry_point), Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)),
     ]));

@@ -86,6 +86,9 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
         let mut peb_walking = false;
         let mut api_hashing = false;
+        let mut direct_syscalls = false;
+        let mut indirect_syscalls = false;
+        let mut syscall_locations = Vec::new();
 
         let bitness = if pe.is_64bit { 64 } else { 32 };
 
@@ -95,19 +98,29 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
                 let end = (start + section.raw_size as usize).min(data.len());
                 if start < end {
                     let section_data = &data[start..end];
-                    let (sec_peb, sec_hashing) = scan_peb_and_hashing(bitness, section_data, section.virtual_address);
+                    let (sec_peb, sec_hashing, sec_direct, sec_indirect, sec_locations) = scan_peb_and_hashing(bitness, section_data, section.virtual_address);
                     if sec_peb {
                         peb_walking = true;
                     }
                     if sec_hashing {
                         api_hashing = true;
                     }
+                    if sec_direct {
+                        direct_syscalls = true;
+                    }
+                    if sec_indirect {
+                        indirect_syscalls = true;
+                    }
+                    syscall_locations.extend(sec_locations);
                 }
             }
         }
 
         pe.peb_walking = peb_walking;
         pe.api_hashing = api_hashing;
+        pe.direct_syscalls = direct_syscalls;
+        pe.indirect_syscalls = indirect_syscalls;
+        pe.syscall_locations = syscall_locations;
 
         if has_dyn_loading || pe.peb_walking || pe.api_hashing {
             let sensitive_apis = [
@@ -829,6 +842,20 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         severity: DetectionSeverity::High,
     });
 
+    let direct_sys = pe.as_ref().map(|p| p.direct_syscalls).unwrap_or(false);
+    checks.push(DetectionCheck {
+        name: "Direct Syscalls Detected".into(),
+        triggered: direct_sys,
+        severity: DetectionSeverity::Critical,
+    });
+
+    let indirect_sys = pe.as_ref().map(|p| p.indirect_syscalls).unwrap_or(false);
+    checks.push(DetectionCheck {
+        name: "Indirect Syscalls Detected".into(),
+        triggered: indirect_sys,
+        severity: DetectionSeverity::Critical,
+    });
+
     checks
 }
 
@@ -1030,10 +1057,13 @@ pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
     pe::find_embedded_pe(data, parent_is_pe)
 }
 
-pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: u64) -> (bool, bool) {
-    use iced_x86::{Decoder, DecoderOptions, Register, OpKind, Mnemonic};
+pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: u64) -> (bool, bool, bool, bool, Vec<SyscallLocation>) {
+    use iced_x86::{Decoder, DecoderOptions, Register, OpKind, Mnemonic, NasmFormatter, Formatter};
     let mut peb_walking = false;
     let mut api_hashing = false;
+    let mut direct_syscalls = false;
+    let mut indirect_syscalls = false;
+    let mut syscall_locations = Vec::new();
 
     let mut decoder = Decoder::with_ip(bitness, section_data, virtual_address, DecoderOptions::NONE);
     let mut instructions = Vec::with_capacity(section_data.len() / 4);
@@ -1043,8 +1073,24 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
         instructions.push(instruction.clone());
     }
 
-    // 1. Scan for PEB access
+    let mut formatter = NasmFormatter::new();
+    formatter.options_mut().set_digit_separator("_");
+    formatter.options_mut().set_first_operand_char_index(10);
+
+    // 1. Scan for PEB access and direct syscalls
     for instr in &instructions {
+        let mn = instr.mnemonic();
+        if mn == Mnemonic::Syscall || mn == Mnemonic::Sysenter {
+            direct_syscalls = true;
+            let mut inst_str = String::new();
+            formatter.format(instr, &mut inst_str);
+            syscall_locations.push(SyscallLocation {
+                address: instr.ip(),
+                is_indirect: false,
+                instruction_str: inst_str,
+            });
+        }
+
         for i in 0..instr.op_count() {
             if instr.op_kind(i) == OpKind::Memory {
                 let seg = instr.memory_segment();
@@ -1059,9 +1105,50 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
         }
     }
 
-    // 2. Scan for API Hashing Loop Patterns
+    // 2. Scan for API Hashing Loop Patterns and Indirect Syscalls
     for (idx, instr) in instructions.iter().enumerate() {
         let mnemonic = instr.mnemonic();
+
+        // Check for Indirect Syscalls
+        if mnemonic == Mnemonic::Jmp || mnemonic == Mnemonic::Call {
+            let op0 = instr.op0_kind();
+            if op0 == OpKind::Register {
+                let reg = instr.op0_register();
+                if reg != Register::RSP && reg != Register::RBP && reg != Register::ESP && reg != Register::EBP {
+                    let start_check = idx.saturating_sub(15);
+                    for prev_instr in &instructions[start_check..idx] {
+                        let prev_mn = prev_instr.mnemonic();
+                        if prev_mn == Mnemonic::Mov {
+                            if prev_instr.op0_kind() == OpKind::Register {
+                                let dest_reg = prev_instr.op0_register();
+                                if dest_reg == Register::EAX || dest_reg == Register::RAX {
+                                    let op1 = prev_instr.op1_kind();
+                                    if op1 == OpKind::Immediate8 || op1 == OpKind::Immediate8to32 || op1 == OpKind::Immediate8to64 || op1 == OpKind::Immediate32 || op1 == OpKind::Immediate32to64 || op1 == OpKind::Immediate64 {
+                                        let imm = prev_instr.immediate32();
+                                        if imm > 0 && imm < 600 {
+                                            indirect_syscalls = true;
+
+                                            let mut mov_str = String::new();
+                                            formatter.format(prev_instr, &mut mov_str);
+                                            let mut jmp_str = String::new();
+                                            formatter.format(instr, &mut jmp_str);
+
+                                            syscall_locations.push(SyscallLocation {
+                                                address: instr.ip(),
+                                                is_indirect: true,
+                                                instruction_str: format!("{}; {}", mov_str, jmp_str),
+                                            });
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let is_jcc = matches!(
             mnemonic,
             Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jb | Mnemonic::Jbe |
@@ -1135,7 +1222,7 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
         }
     }
 
-    (peb_walking, api_hashing)
+    (peb_walking, api_hashing, direct_syscalls, indirect_syscalls, syscall_locations)
 }
 
 #[cfg(test)]
@@ -1148,13 +1235,32 @@ mod tests {
         
 
 
-        let (peb, hashing) = scan_peb_and_hashing(64, &hash_loop_code, 0x1000);
+        let (peb, hashing, _, _, _) = scan_peb_and_hashing(64, &hash_loop_code, 0x1000);
         assert!(!peb);
         assert!(hashing);
 
         let peb_code = [0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00];
-        let (peb, hashing) = scan_peb_and_hashing(64, &peb_code, 0x1000);
+        let (peb, hashing, _, _, _) = scan_peb_and_hashing(64, &peb_code, 0x1000);
         assert!(peb);
         assert!(!hashing);
+
+        // Direct Syscall test
+        let direct_code = [0x0F, 0x05]; // syscall
+        let (_, _, direct, indirect, locations) = scan_peb_and_hashing(64, &direct_code, 0x1000);
+        assert!(direct);
+        assert!(!indirect);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].is_indirect, false);
+
+        // Indirect Syscall test
+        let indirect_code = [
+            0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
+            0x41, 0xFF, 0xE3              // jmp r11
+        ];
+        let (_, _, direct, indirect, locations) = scan_peb_and_hashing(64, &indirect_code, 0x1000);
+        assert!(!direct);
+        assert!(indirect);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].is_indirect, true);
     }
 }

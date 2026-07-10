@@ -130,6 +130,16 @@ pub struct PeAnalysis {
     pub api_hashing: bool,
     pub pdb_path: Option<String>,
     pub manifest: Option<String>,
+    pub direct_syscalls: bool,
+    pub indirect_syscalls: bool,
+    pub syscall_locations: Vec<SyscallLocation>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SyscallLocation {
+    pub address: u64,
+    pub is_indirect: bool,
+    pub instruction_str: String,
 }
 
 #[derive(serde::Serialize)]

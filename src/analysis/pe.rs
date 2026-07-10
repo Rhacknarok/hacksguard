@@ -376,6 +376,9 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         api_hashing: false,
         pdb_path,
         manifest,
+        direct_syscalls: false,
+        indirect_syscalls: false,
+        syscall_locations: Vec::new(),
     })
 }
 

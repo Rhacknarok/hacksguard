@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - Unreleased
 
 ### Added
+- **Direct & Indirect Syscall Detection**: Added static analysis checks using `iced-x86` to scan executable sections for the `syscall`/`sysenter` opcode (direct syscalls) and `mov eax/rax, SSN + jmp/call register` sequences (indirect syscalls).
+- **TUI Syscall Info Box**: Added a dedicated "System Calls" section inside the PE Headers tab of the TUI to display the detection status of direct and indirect syscall stubs.
+- **Critical Severity Alerts**: Trigger Critical-severity alarms when direct or indirect syscall signatures are detected.
 - **XML Manifest Extraction**: Implemented manual traversal of the PE resource directory tree (`IMAGE_RESOURCE_DIRECTORY` and `IMAGE_RESOURCE_DATA_ENTRY`) to parse and extract the embedded XML manifest (`RT_MANIFEST`).
 - **XML Manifest UI Tab**: Added a dedicated dynamic tab to render the raw XML manifest formatting in the TUI when present.
 - **XML Manifest Heuristics & Privilege Checks**: Added detection rules checking for high UAC privilege requests (`requireAdministrator`) and UAC auto-elevation parameters.
