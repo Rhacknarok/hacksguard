@@ -126,6 +126,9 @@ pub struct PeAnalysis {
     pub overlay_size: Option<usize>,
     pub obfuscated_apis: Vec<String>,
     pub embedded_pe: Option<Box<PeAnalysis>>,
+    pub peb_walking: bool,
+    pub api_hashing: bool,
+    pub pdb_path: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -134,6 +137,7 @@ pub struct SectionInfo {
     pub virtual_address: u64,
     pub virtual_size: u64,
     pub raw_size: u64,
+    pub raw_offset: u64,
     pub entropy: f64,
     pub characteristics: u32,
     pub flags_str: String,

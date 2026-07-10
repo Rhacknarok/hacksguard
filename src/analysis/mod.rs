@@ -84,36 +84,32 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
             })
         });
 
-        let peb_walking = if pe.ep_bytes.is_empty() {
-            false
-        } else {
-            use iced_x86::{Decoder, DecoderOptions, Register};
-            let bitness = if pe.is_64bit { 64 } else { 32 };
-            let mut decoder = Decoder::with_ip(bitness, &pe.ep_bytes, pe.entry_point as u64, DecoderOptions::NONE);
-            let mut instruction = iced_x86::Instruction::default();
-            let mut found = false;
-            while decoder.can_decode() {
-                decoder.decode_out(&mut instruction);
-                for i in 0..instruction.op_count() {
-                    if instruction.op_kind(i) == iced_x86::OpKind::Memory {
-                        let seg = instruction.memory_segment();
-                        let disp = instruction.memory_displacement64();
-                        if bitness == 32 && seg == Register::FS && disp == 0x30 {
-                            found = true;
-                            break;
-                        }
-                        if bitness == 64 && seg == Register::GS && disp == 0x60 {
-                            found = true;
-                            break;
-                        }
+        let mut peb_walking = false;
+        let mut api_hashing = false;
+
+        let bitness = if pe.is_64bit { 64 } else { 32 };
+
+        for section in &pe.sections {
+            if section.is_executable && section.raw_size > 0 {
+                let start = section.raw_offset as usize;
+                let end = (start + section.raw_size as usize).min(data.len());
+                if start < end {
+                    let section_data = &data[start..end];
+                    let (sec_peb, sec_hashing) = scan_peb_and_hashing(bitness, section_data, section.virtual_address);
+                    if sec_peb {
+                        peb_walking = true;
+                    }
+                    if sec_hashing {
+                        api_hashing = true;
                     }
                 }
-                if found { break; }
             }
-            found
-        };
+        }
 
-        if has_dyn_loading || peb_walking {
+        pe.peb_walking = peb_walking;
+        pe.api_hashing = api_hashing;
+
+        if has_dyn_loading || pe.peb_walking || pe.api_hashing {
             let sensitive_apis = [
                 "VirtualAllocEx", "VirtualProtectEx", "WriteProcessMemory", "CreateRemoteThread",
                 "NtCreateThreadEx", "RtlCreateUserThread", "QueueUserAPC", "SetThreadContext",
@@ -730,35 +726,20 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
     });
 
     // 25. PEB Walking (API Hashing)
-    let peb_walking = pe.as_ref().map(|p| {
-        if p.ep_bytes.is_empty() {
-            return false;
-        }
-        use iced_x86::{Decoder, DecoderOptions, Register};
-        let bitness = if p.is_64bit { 64 } else { 32 };
-        let mut decoder = Decoder::with_ip(bitness, &p.ep_bytes, p.entry_point as u64, DecoderOptions::NONE);
-        let mut instruction = iced_x86::Instruction::default();
-        while decoder.can_decode() {
-            decoder.decode_out(&mut instruction);
-            for i in 0..instruction.op_count() {
-                if instruction.op_kind(i) == iced_x86::OpKind::Memory {
-                    let seg = instruction.memory_segment();
-                    let disp = instruction.memory_displacement64();
-                    if bitness == 32 && seg == Register::FS && disp == 0x30 {
-                        return true;
-                    }
-                    if bitness == 64 && seg == Register::GS && disp == 0x60 {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }).unwrap_or(false);
+    let peb_walking = pe.as_ref().map(|p| p.peb_walking).unwrap_or(false);
 
     checks.push(DetectionCheck {
         name: "PEB Walking (API Hashing)".into(),
         triggered: peb_walking,
+        severity: DetectionSeverity::High,
+    });
+
+    // API Hashing loop detected
+    let api_hashing = pe.as_ref().map(|p| p.api_hashing).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "API Hashing loop detected".into(),
+        triggered: api_hashing,
         severity: DetectionSeverity::High,
     });
 
@@ -800,6 +781,28 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
     checks.push(DetectionCheck {
         name: "Selective API Obfuscation".into(),
         triggered: selective_api_obfuscation,
+        severity: DetectionSeverity::High,
+    });
+
+    let has_pdb = pe.as_ref().map(|p| p.pdb_path.is_some()).unwrap_or(false);
+    checks.push(DetectionCheck {
+        name: "PDB path found".into(),
+        triggered: has_pdb,
+        severity: DetectionSeverity::Info,
+    });
+
+    let pdb_suspicious = pe.as_ref().map(|p| {
+        if let Some(ref path) = p.pdb_path {
+            let path_lower = path.to_lowercase();
+            ["malware", "trojan", "exploit", "hack", "stealer", "bypass", "inject"].iter().any(|&k| path_lower.contains(k))
+        } else {
+            false
+        }
+    }).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "Suspicious PDB path".into(),
+        triggered: pdb_suspicious,
         severity: DetectionSeverity::High,
     });
 
@@ -1002,4 +1005,133 @@ fn yara_severity(rule_name: &str) -> DetectionSeverity {
 
 pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
     pe::find_embedded_pe(data, parent_is_pe)
+}
+
+pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: u64) -> (bool, bool) {
+    use iced_x86::{Decoder, DecoderOptions, Register, OpKind, Mnemonic};
+    let mut peb_walking = false;
+    let mut api_hashing = false;
+
+    let mut decoder = Decoder::with_ip(bitness, section_data, virtual_address, DecoderOptions::NONE);
+    let mut instructions = Vec::with_capacity(section_data.len() / 4);
+    let mut instruction = iced_x86::Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        instructions.push(instruction.clone());
+    }
+
+    // 1. Scan for PEB access
+    for instr in &instructions {
+        for i in 0..instr.op_count() {
+            if instr.op_kind(i) == OpKind::Memory {
+                let seg = instr.memory_segment();
+                let disp = instr.memory_displacement64();
+                if bitness == 32 && seg == Register::FS && (disp == 0x30 || disp == 0x18) {
+                    peb_walking = true;
+                }
+                if bitness == 64 && seg == Register::GS && (disp == 0x60 || disp == 0x30) {
+                    peb_walking = true;
+                }
+            }
+        }
+    }
+
+    // 2. Scan for API Hashing Loop Patterns
+    for (idx, instr) in instructions.iter().enumerate() {
+        let mnemonic = instr.mnemonic();
+        let is_jcc = matches!(
+            mnemonic,
+            Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jb | Mnemonic::Jbe |
+            Mnemonic::Je | Mnemonic::Jg | Mnemonic::Jge | Mnemonic::Jl | Mnemonic::Jle |
+            Mnemonic::Jne | Mnemonic::Jno | Mnemonic::Jnp | Mnemonic::Jns |
+            Mnemonic::Jo | Mnemonic::Jp | Mnemonic::Js
+        );
+        if mnemonic == Mnemonic::Jmp || is_jcc {
+            let target_ip = instr.near_branch_target();
+            if target_ip < instr.ip() && target_ip >= virtual_address {
+                let mut loop_instrs = Vec::new();
+                for prev_instr in instructions[..idx].iter().rev() {
+                    if prev_instr.ip() >= target_ip {
+                        loop_instrs.push(prev_instr);
+                    } else {
+                        break;
+                    }
+                }
+
+                if !loop_instrs.is_empty() && loop_instrs.len() < 100 {
+                    let mut has_byte_load = false;
+                    let mut has_hash_op = false;
+
+                    for li in &loop_instrs {
+                        if li.mnemonic() == Mnemonic::Movzx {
+                            has_byte_load = true;
+                        }
+                        for i in 0..li.op_count() {
+                            if li.op_kind(i) == OpKind::Memory && li.memory_size().size() == 1 {
+                                has_byte_load = true;
+                            }
+                        }
+
+                        let mn = li.mnemonic();
+                        if mn == Mnemonic::Shl || mn == Mnemonic::Shr || mn == Mnemonic::Ror || mn == Mnemonic::Rol {
+                            if li.op_count() > 1 {
+                                let op_k = li.op_kind(1);
+                                if op_k == OpKind::Immediate8 || op_k == OpKind::Immediate8to32 {
+                                    let shift = li.immediate8();
+                                    if shift == 5 || shift == 13 || shift == 7 || shift == 19 {
+                                        has_hash_op = true;
+                                    }
+                                }
+                            }
+                        } else if mn == Mnemonic::Imul {
+                            if li.op_count() > 2 {
+                                let op_k = li.op_kind(2);
+                                if op_k == OpKind::Immediate32 || op_k == OpKind::Immediate8to32 || op_k == OpKind::Immediate8 || op_k == OpKind::Immediate8to64 || op_k == OpKind::Immediate32to64 {
+                                    let val = if op_k == OpKind::Immediate8to32 { li.immediate8to32() as u32 } else { li.immediate32() };
+                                    if val == 33 || val == 131 || val == 16777619 || val == 65599 {
+                                        has_hash_op = true;
+                                    }
+                                }
+                            } else if li.op_count() > 1 {
+                                let op_k = li.op_kind(1);
+                                if op_k == OpKind::Immediate32 || op_k == OpKind::Immediate8to32 || op_k == OpKind::Immediate8 || op_k == OpKind::Immediate8to64 || op_k == OpKind::Immediate32to64 {
+                                    let val = if op_k == OpKind::Immediate8to32 { li.immediate8to32() as u32 } else { li.immediate32() };
+                                    if val == 33 || val == 131 || val == 16777619 || val == 65599 {
+                                        has_hash_op = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if has_byte_load && has_hash_op {
+                        api_hashing = true;
+                    }
+                }
+            }
+        }
+    }
+
+    (peb_walking, api_hashing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_peb_and_hashing() {
+        let hash_loop_code = [0x0F, 0xB6, 0x06, 0x6B, 0xC0, 0x21, 0x75, 0xF8];
+        
+
+
+        let (peb, hashing) = scan_peb_and_hashing(64, &hash_loop_code, 0x1000);
+        assert!(!peb);
+        assert!(hashing);
+
+        let peb_code = [0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00];
+        let (peb, hashing) = scan_peb_and_hashing(64, &peb_code, 0x1000);
+        assert!(peb);
+        assert!(!hashing);
+    }
 }

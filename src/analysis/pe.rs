@@ -107,6 +107,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
             virtual_address: section.virtual_address as u64,
             virtual_size: vsize,
             raw_size,
+            raw_offset: section.pointer_to_raw_data as u64,
             entropy: section_entropy,
             characteristics: chars,
             flags_str: flags,
@@ -299,6 +300,26 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         }
     }
 
+    let pdb_path = pe.debug_data.and_then(|debug_data| {
+        if let Some(pdb_info) = debug_data.codeview_pdb70_debug_info {
+            let filename_bytes = pdb_info.filename;
+            let len = filename_bytes.iter().position(|&b| b == 0).unwrap_or(filename_bytes.len());
+            let path_str = String::from_utf8_lossy(&filename_bytes[..len]).into_owned();
+            if !path_str.trim().is_empty() {
+                return Some(path_str);
+            }
+        }
+        if let Some(pdb_info) = debug_data.codeview_pdb20_debug_info {
+            let filename_bytes = pdb_info.filename;
+            let len = filename_bytes.iter().position(|&b| b == 0).unwrap_or(filename_bytes.len());
+            let path_str = String::from_utf8_lossy(&filename_bytes[..len]).into_owned();
+            if !path_str.trim().is_empty() {
+                return Some(path_str);
+            }
+        }
+        None
+    });
+
     Ok(PeAnalysis {
         machine,
         timestamp,
@@ -326,6 +347,9 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         overlay_size,
         obfuscated_apis: Vec::new(),
         embedded_pe: None,
+        peb_walking: false,
+        api_hashing: false,
+        pdb_path,
     })
 }
 

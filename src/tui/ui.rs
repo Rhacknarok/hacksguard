@@ -301,6 +301,9 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
                 Style::default().fg(ts_color),
             ),
         ]));
+        if let Some(ref pdb) = pe.pdb_path {
+            lines.push(kv_line("PDB Path", pdb));
+        }
     }
     lines.push(Line::from(""));
 }
@@ -959,9 +962,12 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
         kv_line("Image Base", &format!("{:#010x}", pe.image_base)),
         kv_line("Subsystem", &pe.subsystem),
         kv_line("Linker", &pe.linker_version),
-        Line::from(""),
-        section_header("Security Mitigations"),
     ];
+    if let Some(ref pdb) = pe.pdb_path {
+        center_lines.push(kv_line("PDB Path", pdb));
+    }
+    center_lines.push(Line::from(""));
+    center_lines.push(section_header("Security Mitigations"));
 
     let aslr = (pe.dll_characteristics & 0x0040) != 0;
     let dep = (pe.dll_characteristics & 0x0100) != 0;
