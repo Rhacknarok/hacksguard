@@ -129,6 +129,7 @@ pub struct PeAnalysis {
     pub peb_walking: bool,
     pub api_hashing: bool,
     pub pdb_path: Option<String>,
+    pub manifest: Option<String>,
 }
 
 #[derive(serde::Serialize)]

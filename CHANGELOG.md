@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - Unreleased
 
 ### Added
+- **XML Manifest Extraction**: Implemented manual traversal of the PE resource directory tree (`IMAGE_RESOURCE_DIRECTORY` and `IMAGE_RESOURCE_DATA_ENTRY`) to parse and extract the embedded XML manifest (`RT_MANIFEST`).
+- **XML Manifest UI Tab**: Added a dedicated dynamic tab to render the raw XML manifest formatting in the TUI when present.
+- **XML Manifest Heuristics & Privilege Checks**: Added detection rules checking for high UAC privilege requests (`requireAdministrator`) and UAC auto-elevation parameters.
 - **PDB Path Extraction**: Added extraction of CodeView PDB paths (PDB 2.0 and PDB 7.0 structures) from the PE Debug Directory.
 - **PDB Path UI Rendering**: Rendered the extracted PDB path in the TUI general metadata block and the Optional Header section.
 - **PDB Path Evasion & Detection Checks**: Added detection rules to check for the presence of a PDB path and trigger a High-severity warning if the path contains suspicious keywords (e.g., malware, exploit, stealer).

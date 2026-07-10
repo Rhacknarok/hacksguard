@@ -23,11 +23,14 @@ pub struct App {
 impl App {
     pub fn new(result: AnalysisResult) -> Self {
         let mut tab_names = vec!["Overview".to_string()];
-        if result.pe.is_some() {
+        if let Some(ref pe) = result.pe {
             tab_names.push("Headers".into());
             tab_names.push("Sections".into());
             tab_names.push("Imports".into());
             tab_names.push("Disasm".into());
+            if pe.manifest.is_some() {
+                tab_names.push("Manifest".into());
+            }
         }
         tab_names.push("Hex View".into());
         tab_names.push("Strings".into());
@@ -170,11 +173,14 @@ impl App {
 
     pub fn rebuild_tabs(&mut self) {
         let mut tab_names = vec!["Overview".to_string()];
-        if self.current_pe().is_some() {
+        if let Some(pe) = self.current_pe() {
             tab_names.push("Headers".into());
             tab_names.push("Sections".into());
             tab_names.push("Imports".into());
             tab_names.push("Disasm".into());
+            if pe.manifest.is_some() {
+                tab_names.push("Manifest".into());
+            }
         }
         tab_names.push("Hex View".into());
         tab_names.push("Strings".into());

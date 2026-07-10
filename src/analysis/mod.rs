@@ -806,6 +806,29 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         severity: DetectionSeverity::High,
     });
 
+    let (manifest_admin, manifest_autoelevate) = pe.as_ref().map(|p| {
+        if let Some(ref m) = p.manifest {
+            let m_lower = m.to_lowercase();
+            let admin = m_lower.contains("requireadministrator");
+            let autoelevate = m_lower.contains("autoelevate") && m_lower.contains("true");
+            (admin, autoelevate)
+        } else {
+            (false, false)
+        }
+    }).unwrap_or((false, false));
+
+    checks.push(DetectionCheck {
+        name: "Admin privileges requested (Manifest)".into(),
+        triggered: manifest_admin,
+        severity: DetectionSeverity::Medium,
+    });
+
+    checks.push(DetectionCheck {
+        name: "UAC AutoElevate requested (Manifest)".into(),
+        triggered: manifest_autoelevate,
+        severity: DetectionSeverity::High,
+    });
+
     checks
 }
 

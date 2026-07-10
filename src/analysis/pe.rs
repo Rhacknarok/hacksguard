@@ -300,6 +300,31 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         }
     }
 
+    let manifest = if let Some(opt) = pe.header.optional_header {
+        let file_alignment = opt.windows_fields.file_alignment;
+        let dirs = opt.data_directories.data_directories;
+        if let Some(Some((_, rsrc_dir))) = dirs.get(2) {
+            let rva = rsrc_dir.virtual_address as usize;
+            let size = rsrc_dir.size as usize;
+            let offset = goblin::pe::utils::find_offset(
+                rva,
+                &pe.sections,
+                file_alignment,
+                &goblin::pe::options::ParseOptions::default(),
+            ).unwrap_or(0);
+
+            if offset > 0 && offset + size <= data.len() {
+                find_manifest(&data[offset..offset + size], &pe.sections, file_alignment, data)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let pdb_path = pe.debug_data.and_then(|debug_data| {
         if let Some(pdb_info) = debug_data.codeview_pdb70_debug_info {
             let filename_bytes = pdb_info.filename;
@@ -350,6 +375,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         peb_walking: false,
         api_hashing: false,
         pdb_path,
+        manifest,
     })
 }
 
@@ -591,6 +617,96 @@ pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
             }
         }
         offset += 1;
+    }
+    None
+}
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    if offset + 2 <= data.len() {
+        Some(u16::from_le_bytes([data[offset], data[offset + 1]]))
+    } else {
+        None
+    }
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    if offset + 4 <= data.len() {
+        Some(u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]))
+    } else {
+        None
+    }
+}
+
+fn find_manifest(rsrc_bytes: &[u8], sections: &[goblin::pe::section_table::SectionTable], file_alignment: u32, full_data: &[u8]) -> Option<String> {
+    let num_named = read_u16(rsrc_bytes, 12)? as usize;
+    let num_id = read_u16(rsrc_bytes, 14)? as usize;
+    let total_entries = num_named + num_id;
+
+    for i in 0..total_entries {
+        let entry_offset = 16 + i * 8;
+        let type_id = read_u32(rsrc_bytes, entry_offset)?;
+        let offset_to_dir = read_u32(rsrc_bytes, entry_offset + 4)?;
+
+        if type_id == 24 {
+            if (offset_to_dir & 0x8000_0000) != 0 {
+                let name_dir_offset = (offset_to_dir & 0x7FFF_FFFF) as usize;
+                return walk_name_dir(rsrc_bytes, name_dir_offset, sections, file_alignment, full_data);
+            }
+        }
+    }
+    None
+}
+
+fn walk_name_dir(rsrc_bytes: &[u8], dir_offset: usize, sections: &[goblin::pe::section_table::SectionTable], file_alignment: u32, full_data: &[u8]) -> Option<String> {
+    let num_named = read_u16(rsrc_bytes, dir_offset + 12)? as usize;
+    let num_id = read_u16(rsrc_bytes, dir_offset + 14)? as usize;
+    let total_entries = num_named + num_id;
+
+    for i in 0..total_entries {
+        let entry_offset = dir_offset + 16 + i * 8;
+        let _name_id = read_u32(rsrc_bytes, entry_offset)?;
+        let offset_to_dir = read_u32(rsrc_bytes, entry_offset + 4)?;
+
+        if (offset_to_dir & 0x8000_0000) != 0 {
+            let lang_dir_offset = (offset_to_dir & 0x7FFF_FFFF) as usize;
+            return walk_lang_dir(rsrc_bytes, lang_dir_offset, sections, file_alignment, full_data);
+        }
+    }
+    None
+}
+
+fn walk_lang_dir(rsrc_bytes: &[u8], dir_offset: usize, sections: &[goblin::pe::section_table::SectionTable], file_alignment: u32, full_data: &[u8]) -> Option<String> {
+    let num_named = read_u16(rsrc_bytes, dir_offset + 12)? as usize;
+    let num_id = read_u16(rsrc_bytes, dir_offset + 14)? as usize;
+    let total_entries = num_named + num_id;
+
+    for i in 0..total_entries {
+        let entry_offset = dir_offset + 16 + i * 8;
+        let _lang_id = read_u32(rsrc_bytes, entry_offset)?;
+        let offset_to_data = read_u32(rsrc_bytes, entry_offset + 4)?;
+
+        if (offset_to_data & 0x8000_0000) == 0 {
+            let data_entry_offset = offset_to_data as usize;
+            let data_rva = read_u32(rsrc_bytes, data_entry_offset)? as usize;
+            let size = read_u32(rsrc_bytes, data_entry_offset + 4)? as usize;
+
+            let file_offset = goblin::pe::utils::find_offset(
+                data_rva,
+                sections,
+                file_alignment,
+                &goblin::pe::options::ParseOptions::default(),
+            ).unwrap_or(0);
+
+            if file_offset > 0 && file_offset + size <= full_data.len() {
+                let manifest_bytes = &full_data[file_offset..file_offset + size];
+                return Some(String::from_utf8_lossy(manifest_bytes).to_string());
+            }
+        }
     }
     None
 }

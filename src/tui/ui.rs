@@ -32,6 +32,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         "Headers" => draw_headers(frame, chunks[2], app),
         "Sections" => draw_sections(frame, chunks[2], app),
         "Imports" => draw_imports(frame, chunks[2], app),
+        "Manifest" => draw_manifest(frame, chunks[2], app),
         "Entropy" => draw_entropy(frame, chunks[2], app),
         "Disasm" => draw_disasm(frame, chunks[2], app),
         "Hex View" => draw_hexdump(frame, chunks[2], app),
@@ -1730,4 +1731,28 @@ fn draw_entropy(frame: &mut Frame, area: Rect, app: &App) {
         .block(panel_block("Entropy Analysis Details"))
         .wrap(Wrap { trim: false });
     frame.render_widget(info_paragraph, chunks[1]);
+}
+
+fn draw_manifest(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(pe) = app.current_pe() else {
+        frame.render_widget(Paragraph::new(" No PE manifest"), area);
+        return;
+    };
+    let manifest_str = pe.manifest.as_deref().unwrap_or("No manifest found");
+
+    let block = panel_block("Embedded XML Manifest");
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = manifest_str
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme::TEXT))))
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        inner_area,
+    );
 }
