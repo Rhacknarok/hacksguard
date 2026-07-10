@@ -1057,6 +1057,37 @@ pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
     pe::find_embedded_pe(data, parent_is_pe)
 }
 
+pub fn resolve_syscall_name(ssn: u32) -> &'static str {
+    match ssn {
+        0x01 => "possibly NtWorkerFactoryWorkerReady",
+        0x02 => "possibly NtAcceptConnectPort",
+        0x03 => "possibly NtMapUserPhysicalPagesScatter",
+        0x07 => "possibly NtDeviceIoControlFile",
+        0x08 => "possibly NtWriteFile",
+        0x0f => "possibly NtClose",
+        0x10 => "possibly NtQueryObject",
+        0x16 => "possibly NtQueryKey",
+        0x18 => "possibly NtAllocateVirtualMemory",
+        0x20 => "possibly NtReleaseMutant",
+        0x25 => "possibly NtQueryInformationThread",
+        0x26 => "possibly NtOpenProcess",
+        0x28 => "possibly NtMapViewOfSection",
+        0x2a => "possibly NtUnmapViewOfSection",
+        0x2b => "possibly NtReplyWaitReceivePortEx",
+        0x2d => "possibly NtSetEventBoostPriority",
+        0x30 => "possibly NtOpenProcessTokenEx",
+        0x36 => "possibly NtQuerySystemInformation",
+        0x3a => "possibly NtWriteVirtualMemory",
+        0x45 => "possibly NtQueueApcThread",
+        0x50 | 0x4F => "possibly NtProtectVirtualMemory",
+        0x52 => "possibly NtResumeThread",
+        0x78 => "possibly NtAlpcCancelMessage",
+        0xbc => "possibly NtSuspendThread",
+        0xbd | 0xc2 | 0xc7 => "possibly NtCreateThreadEx",
+        _ => "unknown NT API",
+    }
+}
+
 pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: u64) -> (bool, bool, bool, bool, Vec<SyscallLocation>) {
     use iced_x86::{Decoder, DecoderOptions, Register, OpKind, Mnemonic, NasmFormatter, Formatter};
     let mut peb_walking = false;
@@ -1078,16 +1109,41 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
     formatter.options_mut().set_first_operand_char_index(10);
 
     // 1. Scan for PEB access and direct syscalls
-    for instr in &instructions {
+    for (idx, instr) in instructions.iter().enumerate() {
         let mn = instr.mnemonic();
         if mn == Mnemonic::Syscall || mn == Mnemonic::Sysenter {
             direct_syscalls = true;
+
+            // Search back for EAX / RAX loader to find the SSN
+            let mut ssn = None;
+            let start_check = idx.saturating_sub(10);
+            for prev_instr in &instructions[start_check..idx] {
+                if prev_instr.mnemonic() == Mnemonic::Mov {
+                    if prev_instr.op0_kind() == OpKind::Register {
+                        let dest_reg = prev_instr.op0_register();
+                        if dest_reg == Register::EAX || dest_reg == Register::RAX {
+                            let op1 = prev_instr.op1_kind();
+                            if op1 == OpKind::Immediate8 || op1 == OpKind::Immediate8to32 || op1 == OpKind::Immediate8to64 || op1 == OpKind::Immediate32 || op1 == OpKind::Immediate32to64 || op1 == OpKind::Immediate64 {
+                                ssn = Some(prev_instr.immediate32());
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut inst_str = String::new();
             formatter.format(instr, &mut inst_str);
+
+            let display_str = if let Some(val) = ssn {
+                format!("mov eax, {:#x}; {} ({})", val, inst_str, resolve_syscall_name(val))
+            } else {
+                inst_str
+            };
+
             syscall_locations.push(SyscallLocation {
                 address: instr.ip(),
                 is_indirect: false,
-                instruction_str: inst_str,
+                instruction_str: display_str,
             });
         }
 
@@ -1136,7 +1192,7 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
                                             syscall_locations.push(SyscallLocation {
                                                 address: instr.ip(),
                                                 is_indirect: true,
-                                                instruction_str: format!("{}; {}", mov_str, jmp_str),
+                                                instruction_str: format!("{}; {} ({})", mov_str, jmp_str, resolve_syscall_name(imm)),
                                             });
                                             break;
                                         }
