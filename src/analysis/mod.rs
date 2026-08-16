@@ -856,6 +856,19 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         severity: DetectionSeverity::Critical,
     });
 
+    // 34. Stealth C2 Agent Profile (API Hashing + Sparse IAT)
+    let stealth_c2 = pe.as_ref().map(|p| {
+        let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
+        let has_evasive_calls = p.api_hashing || p.peb_walking || p.direct_syscalls || p.indirect_syscalls;
+        has_evasive_calls && total_imports <= 15
+    }).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "Stealth C2 Agent Profile (Evasive Loading + Sparse IAT)".into(),
+        triggered: stealth_c2,
+        severity: DetectionSeverity::Critical,
+    });
+
     checks
 }
 
@@ -1034,6 +1047,34 @@ fn detect_malware_pattern(
                 "Auto-run registry paths".into(),
             ],
         });
+    }
+
+    // 7. Trojan.C2Agent — API hashing / dynamic resolution with hidden/sparse imports (High)
+    if let Some(pe) = pe {
+        let total_imports: usize = pe.imports.iter().map(|dll| dll.functions.len()).sum();
+        let is_sparse_imports = total_imports <= 15;
+        let has_stealth_loading = pe.api_hashing || pe.peb_walking || pe.direct_syscalls || pe.indirect_syscalls;
+
+        if has_stealth_loading && is_sparse_imports {
+            let mut indicators = Vec::new();
+            if pe.api_hashing {
+                indicators.push("API Hashing loop detected (dynamic export resolution)".into());
+            }
+            if pe.peb_walking {
+                indicators.push("PEB Walking detected (FS/GS segment access)".into());
+            }
+            if pe.direct_syscalls || pe.indirect_syscalls {
+                indicators.push("Custom Syscall stubs detected".into());
+            }
+            indicators.push(format!("Sparse/hidden import table ({} imported APIs)", total_imports));
+
+            return Some(MalwarePattern {
+                family: "Trojan.C2Agent".into(),
+                confidence: "High".into(),
+                description: "Stealth implant / C2 agent utilizing API hashing or evasive system calls with minimal import table footprint".into(),
+                matched_indicators: indicators,
+            });
+        }
     }
 
     None
