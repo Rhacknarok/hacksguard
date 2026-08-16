@@ -856,11 +856,12 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         severity: DetectionSeverity::Critical,
     });
 
-    // 34. Stealth C2 Agent Profile (API Hashing + Sparse IAT)
+    // 34. Stealth C2 Agent Profile (Evasive Loading / API Hashing)
     let stealth_c2 = pe.as_ref().map(|p| {
-        let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
         let has_evasive_calls = p.api_hashing || p.peb_walking || p.direct_syscalls || p.indirect_syscalls;
-        has_evasive_calls && total_imports <= 15
+        let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
+        // C2 beacons either have minimal imports (<= 30) or rely heavily on dynamic resolution
+        has_evasive_calls && (total_imports <= 35 || p.imports.len() <= 3)
     }).unwrap_or(false);
 
     checks.push(DetectionCheck {
@@ -1052,7 +1053,7 @@ fn detect_malware_pattern(
     // 7. Trojan.C2Agent — API hashing / dynamic resolution with hidden/sparse imports (High)
     if let Some(pe) = pe {
         let total_imports: usize = pe.imports.iter().map(|dll| dll.functions.len()).sum();
-        let is_sparse_imports = total_imports <= 15;
+        let is_sparse_imports = total_imports <= 35 || pe.imports.len() <= 3;
         let has_stealth_loading = pe.api_hashing || pe.peb_walking || pe.direct_syscalls || pe.indirect_syscalls;
 
         if has_stealth_loading && is_sparse_imports {
@@ -1066,7 +1067,7 @@ fn detect_malware_pattern(
             if pe.direct_syscalls || pe.indirect_syscalls {
                 indicators.push("Custom Syscall stubs detected".into());
             }
-            indicators.push(format!("Sparse/hidden import table ({} imported APIs)", total_imports));
+            indicators.push(format!("Sparse/hidden import table ({} imported APIs across {} DLLs)", total_imports, pe.imports.len()));
 
             return Some(MalwarePattern {
                 family: "Trojan.C2Agent".into(),
