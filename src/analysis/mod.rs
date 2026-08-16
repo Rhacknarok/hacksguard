@@ -1166,39 +1166,70 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
         let mnemonic = instr.mnemonic();
 
         // Check for Indirect Syscalls
-        if mnemonic == Mnemonic::Jmp || mnemonic == Mnemonic::Call {
+        // Valid indirect syscall pattern:
+        // 1. mov r10, rcx (fastcall conversion) within close proximity (<= 6 instrs)
+        // 2. mov eax/rax, <SSN> (0 < SSN < 0x300)
+        // 3. jmp reg (NOT call, to maintain kernel return stack alignment)
+        if mnemonic == Mnemonic::Jmp {
             let op0 = instr.op0_kind();
             if op0 == OpKind::Register {
                 let reg = instr.op0_register();
-                if reg != Register::RSP && reg != Register::RBP && reg != Register::ESP && reg != Register::EBP {
-                    let start_check = idx.saturating_sub(15);
-                    for prev_instr in &instructions[start_check..idx] {
+                if reg != Register::RSP && reg != Register::RBP && reg != Register::ESP && reg != Register::EBP && reg != Register::RIP {
+                    let start_check = idx.saturating_sub(6);
+                    let preceding = &instructions[start_check..idx];
+
+                    let mut found_r10_rcx = false;
+                    let mut found_ssn: Option<(u32, &iced_x86::Instruction)> = None;
+
+                    for prev_instr in preceding {
                         let prev_mn = prev_instr.mnemonic();
-                        if prev_mn == Mnemonic::Mov {
-                            if prev_instr.op0_kind() == OpKind::Register {
-                                let dest_reg = prev_instr.op0_register();
-                                if dest_reg == Register::EAX || dest_reg == Register::RAX {
-                                    let op1 = prev_instr.op1_kind();
-                                    if op1 == OpKind::Immediate8 || op1 == OpKind::Immediate8to32 || op1 == OpKind::Immediate8to64 || op1 == OpKind::Immediate32 || op1 == OpKind::Immediate32to64 || op1 == OpKind::Immediate64 {
-                                        let imm = prev_instr.immediate32();
-                                        if imm > 0 && imm < 600 {
-                                            indirect_syscalls = true;
 
-                                            let mut mov_str = String::new();
-                                            formatter.format(prev_instr, &mut mov_str);
-                                            let mut jmp_str = String::new();
-                                            formatter.format(instr, &mut jmp_str);
+                        // Check `mov r10, rcx` or `mov r10d, ecx`
+                        if prev_mn == Mnemonic::Mov
+                            && prev_instr.op0_kind() == OpKind::Register
+                            && (prev_instr.op0_register() == Register::R10 || prev_instr.op0_register() == Register::R10D)
+                            && prev_instr.op1_kind() == OpKind::Register
+                            && (prev_instr.op1_register() == Register::RCX || prev_instr.op1_register() == Register::ECX)
+                        {
+                            found_r10_rcx = true;
+                        }
 
-                                            syscall_locations.push(SyscallLocation {
-                                                address: instr.ip(),
-                                                is_indirect: true,
-                                                instruction_str: format!("{}; {} ({})", mov_str, jmp_str, resolve_syscall_name(imm)),
-                                            });
-                                            break;
-                                        }
+                        // Check `mov eax/rax, <SSN>`
+                        if prev_mn == Mnemonic::Mov
+                            && prev_instr.op0_kind() == OpKind::Register
+                        {
+                            let dest_reg = prev_instr.op0_register();
+                            if dest_reg == Register::EAX || dest_reg == Register::RAX {
+                                let op1 = prev_instr.op1_kind();
+                                if matches!(
+                                    op1,
+                                    OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64
+                                        | OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate64
+                                ) {
+                                    let imm = prev_instr.immediate32();
+                                    if imm > 0 && imm < 0x400 {
+                                        found_ssn = Some((imm, prev_instr));
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Strict criteria: requires SSN load AND r10<-rcx setup in same stub
+                    if let Some((ssn, ssn_instr)) = found_ssn {
+                        if found_r10_rcx {
+                            indirect_syscalls = true;
+
+                            let mut mov_str = String::new();
+                            formatter.format(ssn_instr, &mut mov_str);
+                            let mut jmp_str = String::new();
+                            formatter.format(instr, &mut jmp_str);
+
+                            syscall_locations.push(SyscallLocation {
+                                address: instr.ip(),
+                                is_indirect: true,
+                                instruction_str: format!("{}; {} ({})", mov_str, jmp_str, resolve_syscall_name(ssn)),
+                            });
                         }
                     }
                 }
