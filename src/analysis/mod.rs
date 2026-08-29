@@ -1,5 +1,6 @@
 pub mod basic;
 pub mod pe;
+pub mod elf;
 
 use crate::models::*;
 use color_eyre::Result;
@@ -26,7 +27,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
     };
 
     let data_ref = &data;
-    let (basic_result, entropy_graph, pe_result, yara_matches) = std::thread::scope(|s| {
+    let (basic_result, entropy_graph, pe_result, elf_result, yara_matches) = std::thread::scope(|s| {
         let tx1 = progress_tx.clone();
         let basic_handle = s.spawn(move || {
             let res = basic::analyze(data_ref);
@@ -42,14 +43,14 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         });
 
         let tx3 = progress_tx.clone();
-        let pe_handle = s.spawn(move || {
-            let res = if file_type == FileType::PE {
-                pe::analyze(data_ref).ok()
-            } else {
-                None
+        let binary_handle = s.spawn(move || {
+            let (pe, elf) = match file_type {
+                FileType::PE => (pe::analyze(data_ref).ok(), None),
+                FileType::ELF => (None, elf::analyze(data_ref).ok()),
+                _ => (None, None),
             };
             if let Some(tx) = &tx3 { let _ = tx.send(()); }
-            res
+            (pe, elf)
         });
 
         let yara_handle = if run_yara {
@@ -65,14 +66,14 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
         let basic = basic_handle.join().unwrap();
         let entropy = entropy_handle.join().unwrap();
-        let pe = pe_handle.join().unwrap();
+        let (pe, elf) = binary_handle.join().unwrap();
         let yara = if let Some(h) = yara_handle {
             h.join().unwrap()
         } else {
             Vec::new()
         };
 
-        (basic, entropy, pe, yara)
+        (basic, entropy, pe, elf, yara)
     });
 
     let mut pe_result = pe_result;
@@ -151,15 +152,16 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         }
     }
 
-    let detection_checks = build_detection_checks(&basic_result, &pe_result, file_info.size);
+    let detection_checks = build_detection_checks(&basic_result, &pe_result, &elf_result, file_info.size);
     let (risk_score, risk_level) = compute_risk_from_checks(&detection_checks, &yara_matches);
-    let (_, _, risk_breakdown) = compute_risk(&basic_result, &pe_result);
-    let malware_pattern = detect_malware_pattern(&basic_result, &pe_result);
+    let (_, _, risk_breakdown) = compute_risk(&basic_result, &pe_result, &elf_result);
+    let malware_pattern = detect_malware_pattern(&basic_result, &pe_result, &elf_result);
 
     Ok(AnalysisResult {
         file_info,
         basic: basic_result,
         pe: pe_result,
+        elf: elf_result,
         risk_score,
         risk_level,
         risk_breakdown,
@@ -381,7 +383,7 @@ pub fn compute_risk_from_checks(checks: &[DetectionCheck], yara_matches: &[Strin
     (score, level)
 }
 
-fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLevel, RiskBreakdown) {
+fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>) -> (u32, RiskLevel, RiskBreakdown) {
     let mut score: u32 = 0;
 
     // Entropy
@@ -397,7 +399,8 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLev
     score += entropy_score;
 
     // Packing
-    let packing_score = if basic.is_packed { 15 } else { 0 };
+    let is_packed = basic.is_packed || pe.as_ref().map_or(false, |p| p.packer_detected.is_some()) || elf.as_ref().map_or(false, |e| e.packer_detected.is_some());
+    let packing_score = if is_packed { 15 } else { 0 };
     score += packing_score;
 
     // Suspicious strings
@@ -409,7 +412,7 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLev
     let string_score = sus.min(15);
     score += string_score;
 
-    // API risk + anomalies (PE-only)
+    // API risk + anomalies (PE or ELF)
     let mut api_score: u32 = 0;
     let mut anomaly_score: u32 = 0;
 
@@ -428,6 +431,27 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLev
         score += api_score;
 
         for a in &pe.anomalies {
+            match a.severity {
+                AnomalySeverity::Critical => anomaly_score += 12,
+                AnomalySeverity::Warning => anomaly_score += 4,
+                AnomalySeverity::Info => {}
+            }
+        }
+        anomaly_score = anomaly_score.min(25);
+        score += anomaly_score;
+    } else if let Some(elf) = elf {
+        for func in &elf.imported_symbols {
+            match func.risk {
+                ApiRisk::Critical => api_score += 8,
+                ApiRisk::High => api_score += 4,
+                ApiRisk::Medium => api_score += 1,
+                _ => {}
+            }
+        }
+        api_score = api_score.min(25);
+        score += api_score;
+
+        for a in &elf.anomalies {
             match a.severity {
                 AnomalySeverity::Critical => anomaly_score += 12,
                 AnomalySeverity::Warning => anomaly_score += 4,
@@ -460,8 +484,8 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLev
 
 // ─── Detection checks ───────────────────────────────────────────
 
-fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
-    let mut checks = Vec::with_capacity(23);
+fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
+    let mut checks = Vec::with_capacity(35);
 
     // Helper: check if any string matches a category
     let has_category = |cat: &StringCategory| basic.strings.iter().any(|s| &s.category == cat);
@@ -473,15 +497,24 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
     // Helper: check if any imported function name matches (case-insensitive)
     let has_api = |names: &[&str]| -> bool {
         if let Some(pe) = pe {
-            pe.imports.iter().any(|dll| {
+            if pe.imports.iter().any(|dll| {
                 dll.functions.iter().any(|f| {
                     let lower = f.name.to_lowercase();
                     names.iter().any(|n| lower == n.to_lowercase())
                 })
-            })
-        } else {
-            false
+            }) {
+                return true;
+            }
         }
+        if let Some(elf) = elf {
+            if elf.imported_symbols.iter().any(|f| {
+                let lower = f.name.to_lowercase();
+                names.iter().any(|n| lower == n.to_lowercase())
+            }) {
+                return true;
+            }
+        }
+        false
     };
 
     let has_all_apis = |names: &[&str]| -> bool {
@@ -492,6 +525,12 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
                         .iter()
                         .any(|f| f.name.eq_ignore_ascii_case(name))
                 })
+            })
+        } else if let Some(elf) = elf {
+            names.iter().all(|name| {
+                elf.imported_symbols
+                    .iter()
+                    .any(|f| f.name.eq_ignore_ascii_case(name))
             })
         } else {
             false
@@ -892,7 +931,6 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
     let stealth_c2 = pe.as_ref().map(|p| {
         let has_evasive_calls = p.api_hashing || p.peb_walking || p.direct_syscalls || p.indirect_syscalls;
         let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
-        // C2 beacons either have minimal imports (<= 30) or rely heavily on dynamic resolution
         has_evasive_calls && (total_imports <= 35 || p.imports.len() <= 3)
     }).unwrap_or(false);
 
@@ -902,6 +940,55 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         severity: DetectionSeverity::Critical,
     });
 
+    // ─── ELF-Specific Detection Checks ───
+    if let Some(elf) = elf {
+        let has_wx_ph = elf.program_headers.iter().any(|ph| ph.is_write && ph.is_exec);
+        let has_wx_sh = elf.sections.iter().any(|s| s.is_writable && s.is_executable);
+        checks.push(DetectionCheck {
+            name: "W+X Segment / Section (ELF)".into(),
+            triggered: has_wx_ph || has_wx_sh,
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Executable Stack (NX Disabled)".into(),
+            triggered: !elf.mitigations.nx,
+            severity: DetectionSeverity::High,
+        });
+
+        let fileless_exec = has_api(&["memfd_create"]) && (has_api(&["fexecve", "execveat"]) || has_category(&StringCategory::Command));
+        checks.push(DetectionCheck {
+            name: "Fileless execution (memfd_create)".into(),
+            triggered: fileless_exec,
+            severity: DetectionSeverity::Critical,
+        });
+
+        let linux_injection = has_api(&["ptrace", "process_vm_writev"]);
+        checks.push(DetectionCheck {
+            name: "Linux process injection (ptrace)".into(),
+            triggered: linux_injection,
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Direct Syscalls (ELF)".into(),
+            triggered: elf.direct_syscalls,
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Kernel module manipulation".into(),
+            triggered: has_api(&["init_module", "finit_module", "delete_module", "kexec_load"]),
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Known packer detected".into(),
+            triggered: elf.packer_detected.is_some(),
+            severity: DetectionSeverity::High,
+        });
+    }
+
     checks
 }
 
@@ -910,20 +997,27 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
 fn detect_malware_pattern(
     basic: &BasicAnalysis,
     pe: &Option<PeAnalysis>,
+    elf: &Option<ElfAnalysis>,
 ) -> Option<MalwarePattern> {
     // Helper closures
     let has_api = |names: &[&str]| -> bool {
         if let Some(pe) = pe {
-            pe.imports.iter().any(|dll| {
+            if pe.imports.iter().any(|dll| {
                 dll.functions.iter().any(|f| {
-                    names
-                        .iter()
-                        .any(|n| f.name.eq_ignore_ascii_case(n))
+                    names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
                 })
-            })
-        } else {
-            false
+            }) {
+                return true;
+            }
         }
+        if let Some(elf) = elf {
+            if elf.imported_symbols.iter().any(|f| {
+                names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
+            }) {
+                return true;
+            }
+        }
+        false
     };
 
     let has_all_apis = |names: &[&str]| -> bool {
@@ -934,6 +1028,12 @@ fn detect_malware_pattern(
                         .iter()
                         .any(|f| f.name.eq_ignore_ascii_case(name))
                 })
+            })
+        } else if let Some(elf) = elf {
+            names.iter().all(|name| {
+                elf.imported_symbols
+                    .iter()
+                    .any(|f| f.name.eq_ignore_ascii_case(name))
             })
         } else {
             false
@@ -959,13 +1059,20 @@ fn detect_malware_pattern(
         "HttpOpenRequestW",
         "URLDownloadToFileA",
         "URLDownloadToFileW",
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "sendto",
+        "recvfrom",
     ]);
 
     let process_injection = has_all_apis(&[
         "VirtualAllocEx",
         "WriteProcessMemory",
         "CreateRemoteThread",
-    ]);
+    ]) || has_api(&["ptrace", "process_vm_writev"]);
 
     let crypto_apis = has_api(&[
         "CryptEncrypt",
@@ -978,6 +1085,7 @@ fn detect_malware_pattern(
         "IsDebuggerPresent",
         "CheckRemoteDebuggerPresent",
         "NtQueryInformationProcess",
+        "ptrace",
     ]);
 
     let service_apis = has_api(&[
@@ -987,6 +1095,51 @@ fn detect_malware_pattern(
         "OpenServiceW",
     ]);
 
+    // ─── Linux-specific Malware Patterns ───
+    if let Some(elf_info) = elf {
+        // Linux.Rootkit
+        let rootkit_apis = has_api(&["init_module", "finit_module", "kexec_load", "bpf"]);
+        let preload_strings = has_string_containing(&["ld.so.preload", "/etc/ld.so.preload"]);
+        if rootkit_apis || preload_strings {
+            return Some(MalwarePattern {
+                family: "Rootkit.Linux".into(),
+                confidence: "High".into(),
+                description: "Kernel module loading or dynamic linker preload hijacking detected".into(),
+                matched_indicators: vec![
+                    if rootkit_apis { "Kernel module API (init_module/kexec/bpf)".into() } else { "ld.so.preload path reference".into() },
+                ],
+            });
+        }
+
+        // Linux.FilelessDropper
+        if has_api(&["memfd_create"]) && (has_api(&["fexecve", "execveat", "execve"]) || network_apis) {
+            return Some(MalwarePattern {
+                family: "Dropper.Fileless.Linux".into(),
+                confidence: "High".into(),
+                description: "In-memory fileless binary execution via memfd_create and fexecve".into(),
+                matched_indicators: vec![
+                    "memfd_create API import".into(),
+                    "Execution/Network primitives".into(),
+                ],
+            });
+        }
+
+        // Linux.Botnet (Mirai / Gafgyt / Tsunami family)
+        let botnet_strings = has_string_containing(&["/bin/busybox", "telnet", "wget", "tftp", "iptables -F", "/proc/net/tcp"]);
+        let is_embedded_arch = elf_info.machine == "ARM" || elf_info.machine == "MIPS" || elf_info.machine == "RISC-V";
+        if network_apis && (botnet_strings || is_embedded_arch) {
+            return Some(MalwarePattern {
+                family: "Botnet.IoT.Linux".into(),
+                confidence: if botnet_strings && is_embedded_arch { "High" } else { "Medium" }.into(),
+                description: "IoT/Linux botnet signatures (network primitives, busybox/telnet payload strings or embedded architecture)".into(),
+                matched_indicators: vec![
+                    "Network socket APIs".into(),
+                    format!("Architecture: {}", elf_info.machine),
+                ],
+            });
+        }
+    }
+
     // 1. Trojan.Injector — process injection + network (High)
     if process_injection && network_apis {
         return Some(MalwarePattern {
@@ -995,7 +1148,7 @@ fn detect_malware_pattern(
             description: "Process injection combined with network communication capabilities"
                 .into(),
             matched_indicators: vec![
-                "VirtualAllocEx + WriteProcessMemory + CreateRemoteThread".into(),
+                "Process injection APIs (VirtualAllocEx / ptrace)".into(),
                 "Network API imports".into(),
             ],
         });

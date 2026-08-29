@@ -31,6 +31,12 @@ impl App {
             if pe.manifest.is_some() {
                 tab_names.push("Manifest".into());
             }
+        } else if result.elf.is_some() {
+            tab_names.push("Headers".into());
+            tab_names.push("Segments".into());
+            tab_names.push("Sections".into());
+            tab_names.push("Imports".into());
+            tab_names.push("Disasm".into());
         }
         tab_names.push("Hex View".into());
         tab_names.push("Strings".into());
@@ -181,6 +187,12 @@ impl App {
             if pe.manifest.is_some() {
                 tab_names.push("Manifest".into());
             }
+        } else if self.result.elf.is_some() {
+            tab_names.push("Headers".into());
+            tab_names.push("Segments".into());
+            tab_names.push("Sections".into());
+            tab_names.push("Imports".into());
+            tab_names.push("Disasm".into());
         }
         tab_names.push("Hex View".into());
         tab_names.push("Strings".into());

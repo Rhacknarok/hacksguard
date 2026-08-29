@@ -9,6 +9,7 @@ pub struct AnalysisResult {
     pub file_info: FileInfo,
     pub basic: BasicAnalysis,
     pub pe: Option<PeAnalysis>,
+    pub elf: Option<ElfAnalysis>,
     pub risk_score: u32,
     pub risk_level: RiskLevel,
     pub risk_breakdown: RiskBreakdown,
@@ -170,7 +171,7 @@ pub struct DataDirectory {
     pub size: u32,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ImportFunction {
     pub name: String,
     pub risk: ApiRisk,
@@ -194,6 +195,88 @@ impl fmt::Display for ApiRisk {
             Self::Medium => write!(f, "MEDIUM"),
             Self::Low => write!(f, "LOW"),
             Self::None => write!(f, "-"),
+        }
+    }
+}
+
+// ─── ELF analysis ────────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfAnalysis {
+    pub machine: String,
+    pub class: String,
+    pub endianness: String,
+    pub elf_type: String,
+    pub entry_point: u64,
+    pub is_64bit: bool,
+    pub is_pie: bool,
+    pub interpreter: Option<String>,
+    pub soname: Option<String>,
+    pub program_headers: Vec<ElfProgramHeader>,
+    pub sections: Vec<ElfSectionInfo>,
+    pub libraries: Vec<String>,
+    pub imported_symbols: Vec<ImportFunction>,
+    pub exported_symbols: Vec<String>,
+    pub mitigations: ElfMitigations,
+    pub anomalies: Vec<Anomaly>,
+    pub packer_detected: Option<String>,
+    pub ep_bytes: Vec<u8>,
+    pub direct_syscalls: bool,
+    pub syscall_locations: Vec<SyscallLocation>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfProgramHeader {
+    pub ph_type: String,
+    pub flags: String,
+    pub is_read: bool,
+    pub is_write: bool,
+    pub is_exec: bool,
+    pub virtual_address: u64,
+    pub memory_size: u64,
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub alignment: u64,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfSectionInfo {
+    pub name: String,
+    pub section_type: String,
+    pub virtual_address: u64,
+    pub raw_size: u64,
+    pub raw_offset: u64,
+    pub entropy: f64,
+    pub flags_str: String,
+    pub is_executable: bool,
+    pub is_writable: bool,
+    pub anomalies: Vec<String>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfMitigations {
+    pub nx: bool,
+    pub pie: bool,
+    pub relro: ElfRelro,
+    pub stack_canary: bool,
+    pub fortified: bool,
+    pub rpath: Option<String>,
+    pub runpath: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ElfRelro {
+    None,
+    Partial,
+    Full,
+}
+
+impl fmt::Display for ElfRelro {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "No RELRO"),
+            Self::Partial => write!(f, "Partial RELRO"),
+            Self::Full => write!(f, "Full RELRO"),
         }
     }
 }
@@ -224,7 +307,7 @@ impl fmt::Display for RiskLevel {
 
 // ─── Anomalies ───────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct Anomaly {
     pub severity: AnomalySeverity,
     pub description: String,

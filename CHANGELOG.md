@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Linux ELF Static Analysis Support**:
+  - Implemented full ELF parsing module (`src/analysis/elf.rs`) supporting x86, x86-64, ARM, AArch64, MIPS, RISC-V, PowerPC, and s390x binaries.
+  - Added binary hardening & mitigation inspection: Non-Executable stack (`NX` via `PT_GNU_STACK`), Position-Independent Executable (`PIE` via `ET_DYN`), `RELRO` (`None`, `Partial`, `Full`), Stack Canary (`__stack_chk_fail`), Fortified Source, and `RPATH`/`RUNPATH` library hijacking detection.
+  - Added section & segment inspection with Shannon entropy calculation, flagging W+X permissions (`PT_LOAD` / sections) and stripped header anomalies.
+  - Added dynamic symbol categorization and API risk scoring for Linux APIs (`ptrace`, `memfd_create`, `process_vm_writev`, `init_module`, etc.).
+  - Added direct system call opcode scan (`syscall`, `sysenter`, `int 0x80`) via `iced-x86`.
+  - Added Linux malware heuristic pattern detection (`Rootkit.Linux`, `Dropper.Fileless.Linux`, `Botnet.IoT.Linux`).
+  - Added dynamic TUI tabs for ELF binaries (`Headers`, `Segments`, `Sections`, `Imports`, `Disasm`) and integrated metadata into the Overview dashboard.
+
 ### Fixed
 - **Cross-Platform YARA Cache & Path Resolution**: Fixed `.yara_cache` loading failures on non-Windows platforms:
   - Normalized rule file path separators to `/` across OSes during SHA-256 fingerprint generation.

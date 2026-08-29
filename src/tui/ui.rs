@@ -29,12 +29,37 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let tab_name = &app.tab_names[app.current_tab];
     match tab_name.as_str() {
         "Overview" => draw_overview(frame, chunks[2], app),
-        "Headers" => draw_headers(frame, chunks[2], app),
-        "Sections" => draw_sections(frame, chunks[2], app),
-        "Imports" => draw_imports(frame, chunks[2], app),
+        "Headers" => {
+            if app.current_pe().is_some() {
+                draw_headers(frame, chunks[2], app);
+            } else if app.result.elf.is_some() {
+                draw_elf_headers(frame, chunks[2], app);
+            }
+        }
+        "Segments" => draw_elf_segments(frame, chunks[2], app),
+        "Sections" => {
+            if app.current_pe().is_some() {
+                draw_sections(frame, chunks[2], app);
+            } else if app.result.elf.is_some() {
+                draw_elf_sections(frame, chunks[2], app);
+            }
+        }
+        "Imports" => {
+            if app.current_pe().is_some() {
+                draw_imports(frame, chunks[2], app);
+            } else if app.result.elf.is_some() {
+                draw_elf_imports(frame, chunks[2], app);
+            }
+        }
         "Manifest" => draw_manifest(frame, chunks[2], app),
         "Entropy" => draw_entropy(frame, chunks[2], app),
-        "Disasm" => draw_disasm(frame, chunks[2], app),
+        "Disasm" => {
+            if app.current_pe().is_some() {
+                draw_disasm(frame, chunks[2], app);
+            } else if app.result.elf.is_some() {
+                draw_elf_disasm(frame, chunks[2], app);
+            }
+        }
         "Hex View" => draw_hexdump(frame, chunks[2], app),
         "Strings" => draw_strings(frame, chunks[2], app),
         "Guide" => draw_guide(frame, chunks[2], app),
@@ -237,10 +262,12 @@ fn draw_overview_body(frame: &mut Frame, area: Rect, app: &App) {
 
 fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     let info = &app.result.file_info;
-    let pe_type = if let Some(pe) = app.current_pe() {
+    let file_type_str = if let Some(pe) = app.current_pe() {
         let arch = if pe.is_64bit { "PE32+" } else { "PE32" };
         let kind = if pe.is_dll { "DLL" } else { "EXE" };
         format!("{} {} ({})", arch, kind, pe.machine)
+    } else if let Some(elf) = app.result.elf.as_ref() {
+        format!("ELF {} {} ({})", elf.class, elf.elf_type, elf.machine)
     } else {
         info.file_type.to_string()
     };
@@ -259,7 +286,7 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
         "Size",
         &format!("{} ({})", format_size(info.size), info.size),
     ));
-    lines.push(kv_line("Type", &pe_type));
+    lines.push(kv_line("Type", &file_type_str));
     lines.push(kv_line("Magic", &magic_hex));
 
 
@@ -305,6 +332,50 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
         if let Some(ref pdb) = pe.pdb_path {
             lines.push(kv_line("PDB Path", pdb));
         }
+    } else if let Some(elf) = app.result.elf.as_ref() {
+        lines.push(Line::from(""));
+        lines.push(section_header("ELF Metadata & Hardening"));
+        lines.push(kv_line("Entry Point", &format!("{:#010x}", elf.entry_point)));
+        lines.push(kv_line("Class", &format!("{} ({})", elf.class, elf.endianness)));
+        if let Some(ref interp) = elf.interpreter {
+            lines.push(kv_line("Interpreter", interp));
+        }
+
+        let nx_str = if elf.mitigations.nx { "✅ NX (Non-Exec Stack)" } else { "❌ No NX (Exec Stack!)" };
+        let nx_color = if elf.mitigations.nx { theme::SAFE } else { theme::CRITICAL };
+        lines.push(Line::from(vec![
+            Span::styled(" NX:        ".to_string(), theme::label()),
+            Span::styled(nx_str.to_string(), Style::default().fg(nx_color).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let pie_str = if elf.mitigations.pie { "✅ PIE (Position Indep)" } else { "❌ No PIE" };
+        let pie_color = if elf.mitigations.pie { theme::SAFE } else { theme::WARNING };
+        lines.push(Line::from(vec![
+            Span::styled(" PIE:       ".to_string(), theme::label()),
+            Span::styled(pie_str.to_string(), Style::default().fg(pie_color)),
+        ]));
+
+        let relro_str = match elf.mitigations.relro {
+            ElfRelro::Full => "✅ Full RELRO",
+            ElfRelro::Partial => "⚠ Partial RELRO",
+            ElfRelro::None => "❌ No RELRO",
+        };
+        let relro_color = match elf.mitigations.relro {
+            ElfRelro::Full => theme::SAFE,
+            ElfRelro::Partial => theme::WARNING,
+            ElfRelro::None => theme::CRITICAL,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" RELRO:     ".to_string(), theme::label()),
+            Span::styled(relro_str.to_string(), Style::default().fg(relro_color)),
+        ]));
+
+        let canary_str = if elf.mitigations.stack_canary { "✅ Stack Canary" } else { "❌ No Canary" };
+        let canary_color = if elf.mitigations.stack_canary { theme::SAFE } else { theme::WARNING };
+        lines.push(Line::from(vec![
+            Span::styled(" Canary:    ".to_string(), theme::label()),
+            Span::styled(canary_str.to_string(), Style::default().fg(canary_color)),
+        ]));
     }
     lines.push(Line::from(""));
 }
@@ -452,40 +523,38 @@ fn build_detection_ratio_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 
 fn build_packer_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(section_header("Packer Detection"));
-    if let Some(pe) = app.current_pe() {
-        if let Some(packer) = &pe.packer_detected {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "   ⚠ ".to_string(),
-                    Style::default()
-                        .fg(theme::WARNING)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("Detected: {}", packer),
-                    Style::default().fg(theme::WARNING),
-                ),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "   ✓ ".to_string(),
-                    Style::default()
-                        .fg(theme::SAFE)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "No known packer detected".to_string(),
-                    Style::default().fg(theme::SAFE),
-                ),
-            ]));
-        }
+    let packer = if let Some(pe) = app.current_pe() {
+        pe.packer_detected.as_deref()
+    } else if let Some(elf) = app.result.elf.as_ref() {
+        elf.packer_detected.as_deref()
+    } else {
+        None
+    };
+
+    if let Some(packer) = packer {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "   ⚠ ".to_string(),
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("Detected: {}", packer),
+                Style::default().fg(theme::WARNING),
+            ),
+        ]));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("   — ".to_string(), Style::default().fg(theme::TEXT_DIM)),
             Span::styled(
-                "N/A (not a PE file)".to_string(),
-                Style::default().fg(theme::TEXT_DIM),
+                "   ✓ ".to_string(),
+                Style::default()
+                    .fg(theme::SAFE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "No known packer detected".to_string(),
+                Style::default().fg(theme::SAFE),
             ),
         ]));
     }
@@ -523,6 +592,42 @@ fn build_entropy_histogram_lines(lines: &mut Vec<Line<'static>>, app: &App) {
             ]));
         }
         lines.push(Line::from(""));
+    } else if let Some(elf) = app.result.elf.as_ref() {
+        if !elf.sections.is_empty() {
+            lines.push(section_header("Entropy by Section (ELF)"));
+
+            let bar_w = 25usize;
+            for section in &elf.sections {
+                if section.raw_size == 0 {
+                    continue;
+                }
+                let filled = ((section.entropy / 8.0) * bar_w as f64) as usize;
+                let empty = bar_w.saturating_sub(filled);
+
+                let color = if section.entropy > 7.0 {
+                    theme::CRITICAL
+                } else if section.entropy > 6.0 {
+                    theme::WARNING
+                } else {
+                    theme::SAFE
+                };
+
+                let flag = if section.entropy > 7.0 { " ⚠" } else { "" };
+                let display_name = if section.name.len() > 10 { &section.name[..10] } else { &section.name };
+                let name = format!("{:<10}", display_name);
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("   {} ", name), theme::label()),
+                    Span::styled("█".repeat(filled), Style::default().fg(color)),
+                    Span::styled("░".repeat(empty), Style::default().fg(theme::BORDER)),
+                    Span::styled(
+                        format!(" {:.2}{}", section.entropy, flag),
+                        Style::default().fg(color),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
     }
 }
 
@@ -662,6 +767,34 @@ fn build_import_heatmap_lines(lines: &mut Vec<Line<'static>>, app: &App) {
                     Style::default().fg(theme::TEXT_DIM),
                 )]));
             }
+            lines.push(Line::from(""));
+        }
+    } else if let Some(elf) = app.result.elf.as_ref() {
+        if !elf.imported_symbols.is_empty() || !elf.libraries.is_empty() {
+            lines.push(section_header("ELF Imported Symbols & Libraries"));
+            if !elf.libraries.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("   Libraries: ".to_string(), theme::label()),
+                    Span::styled(elf.libraries.join(", "), Style::default().fg(theme::INFO)),
+                ]));
+            }
+            
+            let crit = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Critical).count();
+            let high = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::High).count();
+            let med = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Medium).count();
+            
+            let mut spans = vec![Span::styled("   Symbols:   ".to_string(), theme::label())];
+            for _ in 0..crit {
+                spans.push(Span::styled("● ".to_string(), Style::default().fg(theme::CRITICAL)));
+            }
+            for _ in 0..high {
+                spans.push(Span::styled("◉ ".to_string(), Style::default().fg(theme::ORANGE)));
+            }
+            for _ in 0..med.min(6) {
+                spans.push(Span::styled("○ ".to_string(), Style::default().fg(theme::WARNING)));
+            }
+            spans.push(Span::styled(format!("({} total)", elf.imported_symbols.len()), Style::default().fg(theme::TEXT_DIM)));
+            lines.push(Line::from(spans));
             lines.push(Line::from(""));
         }
     }
@@ -871,26 +1004,32 @@ fn build_embedded_pe_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 }
 
 fn build_anomalies_lines(lines: &mut Vec<Line<'static>>, app: &App) {
-    if let Some(pe) = app.current_pe() {
-        if !pe.anomalies.is_empty() {
-            lines.push(section_header("Anomalies"));
-            for a in &pe.anomalies {
-                let color = theme::severity_color(&a.severity);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("   [{}] ", a.severity),
-                        Style::default()
-                            .fg(color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        a.description.clone(),
-                        Style::default().fg(theme::TEXT),
-                    ),
-                ]));
-            }
-            lines.push(Line::from(""));
+    let anomalies = if let Some(pe) = app.current_pe() {
+        &pe.anomalies
+    } else if let Some(elf) = app.result.elf.as_ref() {
+        &elf.anomalies
+    } else {
+        return;
+    };
+
+    if !anomalies.is_empty() {
+        lines.push(section_header("Anomalies"));
+        for a in anomalies {
+            let color = theme::severity_color(&a.severity);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("   [{}] ", a.severity),
+                    Style::default()
+                        .fg(color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    a.description.clone(),
+                    Style::default().fg(theme::TEXT),
+                ),
+            ]));
         }
+        lines.push(Line::from(""));
     }
 }
 
@@ -1793,5 +1932,408 @@ fn draw_manifest(frame: &mut Frame, area: Rect, app: &App) {
             .wrap(Wrap { trim: false })
             .scroll((app.scroll_offset, 0)),
         inner_area,
+    );
+}
+
+// ─── ELF Tabs ────────────────────────────────────────────────────
+
+fn draw_elf_headers(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(elf) = app.result.elf.as_ref() else {
+        frame.render_widget(Paragraph::new(" No ELF headers"), area);
+        return;
+    };
+
+    let block = panel_block("ELF Headers & Mitigations");
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::horizontal([
+        Constraint::Percentage(33),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+    ])
+    .split(inner_area);
+
+    // Left Column: Header Information
+    let mut left_lines = vec![
+        section_header("ELF Header"),
+        kv_line("Machine", &elf.machine),
+        kv_line("Class", &elf.class),
+        kv_line("Endianness", &elf.endianness),
+        kv_line("Type", &elf.elf_type),
+        kv_line("Entry Point", &format!("{:#010x}", elf.entry_point)),
+        kv_line("Is 64-bit", &elf.is_64bit.to_string()),
+        kv_line("Is PIE", &elf.is_pie.to_string()),
+    ];
+    if let Some(ref interp) = elf.interpreter {
+        left_lines.push(kv_line("Interpreter", interp));
+    }
+    if let Some(ref soname) = elf.soname {
+        left_lines.push(kv_line("SONAME", soname));
+    }
+
+    // Middle Column: Binary Hardening & Mitigations
+    let mut center_lines = vec![
+        section_header("Mitigations & Hardening"),
+    ];
+
+    let fmt_check = |label: &str, ok: bool, ok_text: &str, bad_text: &str, is_crit: bool| {
+        let (icon, text, color) = if ok {
+            ("✓", ok_text, theme::SAFE)
+        } else if is_crit {
+            ("!", bad_text, theme::CRITICAL)
+        } else {
+            ("⚠", bad_text, theme::WARNING)
+        };
+        Line::from(vec![
+            Span::styled(format!("  {:<12} ", label), theme::label()),
+            Span::styled(format!("{} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(text.to_string(), Style::default().fg(color)),
+        ])
+    };
+
+    center_lines.push(fmt_check("NX Stack", elf.mitigations.nx, "Enabled (Non-Exec Stack)", "Disabled (W+X Stack!)", true));
+    center_lines.push(fmt_check("PIE", elf.mitigations.pie, "Enabled (DYN / ASLR)", "Disabled (Fixed Base)", false));
+    
+    let (relro_icon, relro_text, relro_color) = match elf.mitigations.relro {
+        ElfRelro::Full => ("✓", "Full RELRO", theme::SAFE),
+        ElfRelro::Partial => ("⚠", "Partial RELRO", theme::WARNING),
+        ElfRelro::None => ("!", "No RELRO", theme::CRITICAL),
+    };
+    center_lines.push(Line::from(vec![
+        Span::styled("  RELRO        ", theme::label()),
+        Span::styled(format!("{} ", relro_icon), Style::default().fg(relro_color).add_modifier(Modifier::BOLD)),
+        Span::styled(relro_text.to_string(), Style::default().fg(relro_color)),
+    ]));
+
+    center_lines.push(fmt_check("Canary", elf.mitigations.stack_canary, "Found (__stack_chk)", "Not Detected", false));
+    center_lines.push(fmt_check("FORTIFY", elf.mitigations.fortified, "Found (_chk symbols)", "Not Detected", false));
+
+    if let Some(ref rpath) = elf.mitigations.rpath {
+        center_lines.push(Line::from(""));
+        center_lines.push(section_header("RPATH (Injection Risk)"));
+        center_lines.push(Line::from(Span::styled(format!("  {}", rpath), Style::default().fg(theme::WARNING))));
+    }
+    if let Some(ref runpath) = elf.mitigations.runpath {
+        center_lines.push(Line::from(""));
+        center_lines.push(section_header("RUNPATH"));
+        center_lines.push(Line::from(Span::styled(format!("  {}", runpath), Style::default().fg(theme::TEXT))));
+    }
+
+    // Right Column: Shared Libraries & Direct Syscalls
+    let mut right_lines = vec![
+        section_header("System Calls"),
+    ];
+    let (sys_icon, sys_text, sys_color) = if elf.direct_syscalls {
+        ("!", format!("FOUND ({} instances)", elf.syscall_locations.len()), theme::CRITICAL)
+    } else {
+        ("✓", "None Detected".to_string(), theme::SAFE)
+    };
+    right_lines.push(Line::from(vec![
+        Span::styled("  Direct Sys:  ", theme::label()),
+        Span::styled(format!("{} ", sys_icon), Style::default().fg(sys_color).add_modifier(Modifier::BOLD)),
+        Span::styled(sys_text, Style::default().fg(sys_color)),
+    ]));
+
+    right_lines.push(Line::from(""));
+    right_lines.push(section_header("Shared Libraries (DT_NEEDED)"));
+    if elf.libraries.is_empty() {
+        right_lines.push(Line::from(Span::styled("  (Static binary / No dynamic libs)", Style::default().fg(theme::TEXT_DIM))));
+    } else {
+        for lib in &elf.libraries {
+            right_lines.push(Line::from(vec![
+                Span::styled("  • ", theme::label()),
+                Span::styled(lib, Style::default().fg(theme::INFO)),
+            ]));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(left_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        chunks[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(center_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        chunks[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(right_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        chunks[2],
+    );
+}
+
+fn draw_elf_segments(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(elf) = app.result.elf.as_ref() else {
+        frame.render_widget(Paragraph::new(" No ELF segments"), area);
+        return;
+    };
+
+    let header = Row::new(vec![
+        Cell::from("Type").style(theme::header()),
+        Cell::from("Flags").style(theme::header()),
+        Cell::from("VirtAddr").style(theme::header()),
+        Cell::from("MemSize").style(theme::header()),
+        Cell::from("Offset").style(theme::header()),
+        Cell::from("FileSize").style(theme::header()),
+        Cell::from("Align").style(theme::header()),
+    ])
+    .height(1);
+
+    let rows: Vec<Row> = elf
+        .program_headers
+        .iter()
+        .map(|ph| {
+            let is_wx = ph.is_write && ph.is_exec;
+            let flag_color = if is_wx {
+                theme::CRITICAL
+            } else if ph.is_exec {
+                theme::WARNING
+            } else {
+                theme::TEXT
+            };
+
+            Row::new(vec![
+                Cell::from(ph.ph_type.clone()).style(theme::value()),
+                Cell::from(ph.flags.clone()).style(Style::default().fg(flag_color).add_modifier(if is_wx { Modifier::BOLD } else { Modifier::empty() })),
+                Cell::from(format!("{:#010x}", ph.virtual_address)).style(theme::value()),
+                Cell::from(format!("{:#x}", ph.memory_size)).style(theme::value()),
+                Cell::from(format!("{:#x}", ph.file_offset)).style(theme::value()),
+                Cell::from(format!("{:#x}", ph.file_size)).style(theme::value()),
+                Cell::from(format!("{:#x}", ph.alignment)).style(Style::default().fg(theme::TEXT_DIM)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(8),
+        Constraint::Length(14),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Min(8),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(panel_block("ELF Program Headers (Segments)"))
+        .row_highlight_style(Style::default().bg(theme::BG_PANEL));
+
+    frame.render_widget(table, area);
+}
+
+fn draw_elf_sections(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(elf) = app.result.elf.as_ref() else {
+        frame.render_widget(Paragraph::new(" No ELF sections"), area);
+        return;
+    };
+
+    let header = Row::new(vec![
+        Cell::from("Name").style(theme::header()),
+        Cell::from("Type").style(theme::header()),
+        Cell::from("Addr").style(theme::header()),
+        Cell::from("Size").style(theme::header()),
+        Cell::from("Entropy").style(theme::header()),
+        Cell::from("Flags").style(theme::header()),
+        Cell::from("Anomalies").style(theme::header()),
+    ])
+    .height(1);
+
+    let rows: Vec<Row> = elf
+        .sections
+        .iter()
+        .map(|s| {
+            let ent_color = if s.entropy > 7.0 {
+                theme::CRITICAL
+            } else if s.entropy > 6.0 {
+                theme::WARNING
+            } else {
+                theme::SAFE
+            };
+
+            let is_wx = s.is_executable && s.is_writable;
+            let flag_color = if is_wx {
+                theme::CRITICAL
+            } else if s.is_executable {
+                theme::WARNING
+            } else {
+                theme::TEXT
+            };
+
+            let anomaly_str = if s.anomalies.is_empty() {
+                "—".to_string()
+            } else {
+                s.anomalies.join(", ")
+            };
+
+            Row::new(vec![
+                Cell::from(s.name.clone()).style(theme::value()),
+                Cell::from(s.section_type.clone()).style(Style::default().fg(theme::TEXT_DIM)),
+                Cell::from(format!("{:#010x}", s.virtual_address)).style(theme::value()),
+                Cell::from(format!("{:#x}", s.raw_size)).style(theme::value()),
+                Cell::from(format!("{:.2}", s.entropy)).style(Style::default().fg(ent_color)),
+                Cell::from(s.flags_str.clone()).style(Style::default().fg(flag_color).add_modifier(if is_wx { Modifier::BOLD } else { Modifier::empty() })),
+                Cell::from(anomaly_str).style(Style::default().fg(theme::WARNING)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(panel_block("ELF Sections"))
+        .row_highlight_style(Style::default().bg(theme::BG_PANEL));
+
+    frame.render_widget(table, area);
+}
+
+fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(elf) = app.result.elf.as_ref() else {
+        frame.render_widget(Paragraph::new(" No ELF symbols"), area);
+        return;
+    };
+
+    let mut lines = Vec::new();
+
+    let crit = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Critical).count();
+    let high = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::High).count();
+    let med = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Medium).count();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} Imported Functions across {} Shared Libraries  ", elf.imported_symbols.len(), elf.libraries.len()),
+            theme::value(),
+        ),
+        Span::styled(format!("● {} ", crit), Style::default().fg(theme::CRITICAL)),
+        Span::styled(format!("● {} ", high), Style::default().fg(theme::ORANGE)),
+        Span::styled(format!("● {} ", med), Style::default().fg(theme::WARNING)),
+    ]));
+    lines.push(Line::from(""));
+
+    if !elf.libraries.is_empty() {
+        lines.push(section_header("Shared Libraries (DT_NEEDED)"));
+        for lib in &elf.libraries {
+            lines.push(Line::from(vec![
+                Span::styled("   ▸ ", Style::default().fg(theme::ORANGE_LIGHT)),
+                Span::styled(lib, Style::default().fg(theme::INFO)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines.push(section_header("Imported Dynamic Symbols"));
+    for sym in &elf.imported_symbols {
+        let color = theme::api_risk_color(&sym.risk);
+        let marker = match sym.risk {
+            ApiRisk::Critical => "●",
+            ApiRisk::High => "◉",
+            ApiRisk::Medium => "○",
+            _ => "·",
+        };
+        let risk_tag = if sym.risk != ApiRisk::None {
+            format!(" [{}]", sym.risk)
+        } else {
+            String::new()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {} ", marker), Style::default().fg(color)),
+            Span::styled(&sym.name, Style::default().fg(theme::TEXT)),
+            Span::styled(risk_tag, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    let block = panel_block("ELF Symbols & Imports");
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        area,
+    );
+}
+
+fn draw_elf_disasm(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(elf) = app.result.elf.as_ref() else {
+        frame.render_widget(Paragraph::new(" No ELF metadata for disassembly"), area);
+        return;
+    };
+
+    let mut lines = Vec::new();
+
+    if !elf.syscall_locations.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" Detected Direct System Call Instructions ", Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(""));
+        for loc in &elf.syscall_locations {
+            lines.push(Line::from(vec![
+                Span::styled("  Address: ", Style::default().fg(theme::TEXT_DIM)),
+                Span::styled(format!("{:#010x}", loc.address), Style::default().fg(theme::INFO)),
+                Span::styled("  [Direct]  ", Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
+                Span::styled(&loc.instruction_str, Style::default().fg(theme::TEXT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(" ────────────────────────────────────────────────────────────────────────", Style::default().fg(theme::TEXT_DIM))));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(format!(" Disassembly at Entry Point ({:#010x}) ", elf.entry_point), Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(""));
+
+    let bitness = if elf.is_64bit { 64 } else { 32 };
+    let mut decoder = Decoder::with_ip(bitness, &elf.ep_bytes, elf.entry_point, DecoderOptions::NONE);
+    let mut formatter = NasmFormatter::new();
+    formatter.options_mut().set_digit_separator("_");
+    formatter.options_mut().set_first_operand_char_index(10);
+    
+    let mut instruction = Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        let mut output = String::new();
+        formatter.format(&instruction, &mut output);
+
+        let addr = format!("{:016X}", instruction.ip());
+        let mnemonic_str = output.split_whitespace().next().unwrap_or("").to_string();
+        let rest = output.strip_prefix(&mnemonic_str).unwrap_or("").to_string();
+
+        let line = Line::from(vec![
+            Span::styled(format!(" {} ", addr), Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(format!("{:<8}", mnemonic_str), Style::default().fg(theme::INFO).add_modifier(Modifier::BOLD)),
+            Span::styled(rest, Style::default().fg(theme::TEXT)),
+        ]);
+        lines.push(line);
+    }
+
+    if lines.len() <= 2 {
+        lines.push(Line::from(Span::styled("  No valid instructions found at entry point.", Style::default().fg(theme::TEXT_DIM))));
+    }
+
+    let block = panel_block("ELF Disassembly");
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((app.scroll_offset, 0)),
+        area,
     );
 }
