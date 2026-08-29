@@ -197,6 +197,38 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
 
 const YARA_CACHE_PATH: &str = ".yara_cache";
 
+fn get_rules_dir() -> std::path::PathBuf {
+    let cwd_rules = std::path::Path::new("rules");
+    if cwd_rules.is_dir() {
+        return cwd_rules.to_path_buf();
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let exe_rules = parent.join("rules");
+            if exe_rules.is_dir() {
+                return exe_rules;
+            }
+        }
+    }
+    std::path::PathBuf::from("rules")
+}
+
+fn get_cache_path() -> std::path::PathBuf {
+    let cwd_cache = std::path::Path::new(YARA_CACHE_PATH);
+    if cwd_cache.exists() {
+        return cwd_cache.to_path_buf();
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let exe_cache = parent.join(YARA_CACHE_PATH);
+            if exe_cache.exists() {
+                return exe_cache;
+            }
+        }
+    }
+    std::path::PathBuf::from(YARA_CACHE_PATH)
+}
+
 fn visit_dirs(dir: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -212,26 +244,24 @@ fn visit_dirs(dir: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
 
 /// Compute a SHA-256 fingerprint over all rule file paths + their contents.
 /// Any change in file names, order, or content will invalidate the cache.
-fn compute_rules_fingerprint() -> Vec<u8> {
+fn compute_rules_fingerprint(rules_dir: &std::path::Path) -> Vec<u8> {
     use sha2::{Sha256, Digest};
 
     let mut hasher = Sha256::new();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
-    visit_dirs(std::path::Path::new("rules"), &mut paths);
+    visit_dirs(rules_dir, &mut paths);
     // Sort for deterministic ordering
     paths.sort();
 
     for path in &paths {
-        hasher.update(path.to_string_lossy().as_bytes());
-        if let Ok(meta) = std::fs::metadata(path) {
-            hasher.update(&meta.len().to_le_bytes());
-            if let Ok(mtime) = meta.modified() {
-                if let Ok(dur) = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-                    hasher.update(&dur.as_secs().to_le_bytes());
-                    hasher.update(&dur.subsec_nanos().to_le_bytes());
-                }
-            }
+        let rel_path = path.strip_prefix(rules_dir).unwrap_or(path);
+        let normalized = rel_path.to_string_lossy().replace('\\', "/");
+        hasher.update(normalized.as_bytes());
+
+        if let Ok(content) = std::fs::read(path) {
+            hasher.update(&(content.len() as u64).to_le_bytes());
+            hasher.update(&content);
         }
     }
 
@@ -242,10 +272,12 @@ fn compute_rules_fingerprint() -> Vec<u8> {
 ///
 /// Cache format: [32 bytes fingerprint][boreal-serialized Scanner]
 pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
-    let fingerprint = compute_rules_fingerprint();
+    let rules_dir = get_rules_dir();
+    let cache_path = get_cache_path();
+    let fingerprint = compute_rules_fingerprint(&rules_dir);
 
     // Try loading from cache
-    if let Ok(cache_bytes) = std::fs::read(YARA_CACHE_PATH) {
+    if let Ok(cache_bytes) = std::fs::read(&cache_path) {
         if cache_bytes.len() > 32 && cache_bytes[..32] == fingerprint[..] {
             let params = boreal::scanner::DeserializeParams::default();
             if let Ok(scanner) = boreal::scanner::Scanner::from_bytes_unchecked(&cache_bytes[32..], params) {
@@ -261,7 +293,7 @@ pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
     // Cache miss or invalid → recompile
     let mut compiler = boreal::Compiler::new();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    visit_dirs(std::path::Path::new("rules"), &mut paths);
+    visit_dirs(&rules_dir, &mut paths);
     paths.sort();
     for path in &paths {
         let _ = compiler.add_rules_file(path);
@@ -274,7 +306,7 @@ pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
         let mut cache = Vec::with_capacity(32 + serialized.len());
         cache.extend_from_slice(&fingerprint);
         cache.extend_from_slice(&serialized);
-        let _ = std::fs::write(YARA_CACHE_PATH, &cache);
+        let _ = std::fs::write(&cache_path, &cache);
     }
 
     let res = match scanner.scan_mem(data) {
