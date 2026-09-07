@@ -5,7 +5,6 @@ use goblin::elf::header::*;
 use goblin::elf::program_header::*;
 use goblin::elf::section_header::*;
 use goblin::Object;
-use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
 /// Parse ELF headers, program headers, sections, symbols, mitigations and detect anomalies.
 pub fn analyze(data: &[u8]) -> Result<ElfAnalysis> {
@@ -391,15 +390,19 @@ fn extract_ep_bytes(data: &[u8], elf: &goblin::elf::Elf) -> Vec<u8> {
 }
 
 fn scan_elf_syscalls(data: &[u8], elf: &goblin::elf::Elf) -> (bool, Vec<SyscallLocation>) {
+    let mut locations = Vec::new();
+    let is_aarch64 = elf.header.e_machine == EM_AARCH64;
     let bitness = if elf.header.e_machine == EM_X86_64 {
-        64
+        Some(64)
     } else if elf.header.e_machine == EM_386 {
-        32
+        Some(32)
     } else {
-        return (false, Vec::new());
+        None
     };
 
-    let mut locations = Vec::new();
+    if !is_aarch64 && bitness.is_none() {
+        return (false, locations);
+    }
 
     for ph in &elf.program_headers {
         if ph.p_type == PT_LOAD && (ph.p_flags & PF_X != 0) && ph.p_filesz > 0 {
@@ -410,28 +413,10 @@ fn scan_elf_syscalls(data: &[u8], elf: &goblin::elf::Elf) -> (bool, Vec<SyscallL
             }
 
             let code = &data[start..end];
-            let mut decoder = Decoder::with_ip(bitness, code, ph.p_vaddr, DecoderOptions::NONE);
-
-            while decoder.can_decode() {
-                let instr = decoder.decode();
-                if instr.is_invalid() {
-                    continue;
-                }
-
-                let mnemonic = instr.mnemonic();
-                let is_syscall = match mnemonic {
-                    Mnemonic::Syscall | Mnemonic::Sysenter => true,
-                    Mnemonic::Int => instr.immediate8() == 0x80,
-                    _ => false,
-                };
-
-                if is_syscall {
-                    locations.push(SyscallLocation {
-                        address: instr.ip(),
-                        is_indirect: false,
-                        instruction_str: format!("{:?}", mnemonic).to_lowercase(),
-                    });
-                }
+            if is_aarch64 {
+                locations.extend(crate::analysis::macho::scan_arm64_buffer(code, ph.p_vaddr));
+            } else if let Some(b) = bitness {
+                locations.extend(crate::analysis::macho::scan_x86_buffer(code, ph.p_vaddr, b));
             }
         }
     }

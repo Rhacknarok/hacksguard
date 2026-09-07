@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **macOS Mach-O & Universal Fat Binary Static Analysis**:
+  - Implemented full Mach-O analysis engine (`src/analysis/macho.rs`) parsing single architecture and Universal Fat Mach-O containers (prioritizing ARM64, fallback to x86-64).
+  - Added binary mitigation checks: Position-Independent Executable (`MH_PIE`), Non-Executable Stack (`MH_ALLOW_STACK_EXECUTION`), Heap execution restrictions (`MH_NO_HEAP_EXECUTION`), code signature verification (`LC_CODE_SIGNATURE`), and `RPATH` library search path hijacking risks.
+  - Added segment and section inspection with Shannon entropy calculation, flagging W+X permissions and high-entropy packed sections.
+  - Added Darwin symbol and API classification (`task_for_pid`, `mach_vm_write`, `NSCreateObjectFileImageFromMemory`, `CGEventTapCreate`, `SecKeychainItemCopyAttributesAndData`, `posix_spawn`).
+  - Added macOS malware heuristic pattern detection (`Spyware.macOS`, `Stealer.macOS`, `Injector.macOS`).
+  - Added dynamic TUI tabs for Mach-O binaries (`Headers`, `Segments`, `Sections`, `Imports`, `Disasm`).
+- **Cross-Platform ARM64 Direct Syscall Scanner (`svc`)**:
+  - Implemented zero-dependency bitmask scanner for ARM64 `svc #imm` instructions (`(word & 0xFFE0_001F) == 0xD400_0001`), supporting `svc #0` (Linux AArch64) and `svc #0x80` / `svc #0` (macOS Darwin ARM64).
+  - Integrated ARM64 syscall detection across both ELF (`EM_AARCH64`) and Mach-O (`CPU_TYPE_ARM64`).
+  - Updated TUI disassembly view (`render_disasm`) to display 4-byte instruction words with highlighted syscall stubs on ARM64 architectures without invoking x86 decoders.
 - **Interactive Search (`/`)**:
   - Implemented live substring filtering across Strings, Imports, Sections, and ELF Symbols tabs.
   - Added dedicated status bar input prompt (`/query█`), with `Enter` to apply filter and `Esc` to cancel/clear.

@@ -229,6 +229,12 @@ impl App {
             tab_names.push("Sections".into());
             tab_names.push("Imports".into());
             tab_names.push("Disasm".into());
+        } else if self.result.macho.is_some() {
+            tab_names.push("Headers".into());
+            tab_names.push("Segments".into());
+            tab_names.push("Sections".into());
+            tab_names.push("Imports".into());
+            tab_names.push("Disasm".into());
         }
         tab_names.push("Hex View".into());
         tab_names.push("Strings".into());

@@ -34,14 +34,24 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 draw_headers(frame, chunks[2], app);
             } else if app.result.elf.is_some() {
                 draw_elf_headers(frame, chunks[2], app);
+            } else if app.result.macho.is_some() {
+                draw_macho_headers(frame, chunks[2], app);
             }
         }
-        "Segments" => draw_elf_segments(frame, chunks[2], app),
+        "Segments" => {
+            if app.result.elf.is_some() {
+                draw_elf_segments(frame, chunks[2], app);
+            } else if app.result.macho.is_some() {
+                draw_macho_segments(frame, chunks[2], app);
+            }
+        }
         "Sections" => {
             if app.current_pe().is_some() {
                 draw_sections(frame, chunks[2], app);
             } else if app.result.elf.is_some() {
                 draw_elf_sections(frame, chunks[2], app);
+            } else if app.result.macho.is_some() {
+                draw_macho_sections(frame, chunks[2], app);
             }
         }
         "Imports" => {
@@ -49,6 +59,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 draw_imports(frame, chunks[2], app);
             } else if app.result.elf.is_some() {
                 draw_elf_imports(frame, chunks[2], app);
+            } else if app.result.macho.is_some() {
+                draw_macho_imports(frame, chunks[2], app);
             }
         }
         "Manifest" => draw_manifest(frame, chunks[2], app),
@@ -58,6 +70,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 draw_disasm(frame, chunks[2], app);
             } else if app.result.elf.is_some() {
                 draw_elf_disasm(frame, chunks[2], app);
+            } else if app.result.macho.is_some() {
+                draw_macho_disasm(frame, chunks[2], app);
             }
         }
         "Hex View" => draw_hexdump(frame, chunks[2], app),
@@ -1776,6 +1790,7 @@ fn render_disasm(
     title: &str,
     syscall_locations: &[crate::models::SyscallLocation],
     is_64bit: bool,
+    is_arm64: bool,
     ep_bytes: &[u8],
     entry_point: u64,
 ) {
@@ -1805,28 +1820,51 @@ fn render_disasm(
     ]));
     lines.push(Line::from(""));
 
-    let bitness = if is_64bit { 64 } else { 32 };
-    let mut decoder = Decoder::with_ip(bitness, ep_bytes, entry_point, DecoderOptions::NONE);
-    let mut formatter = NasmFormatter::new();
-    formatter.options_mut().set_digit_separator("_");
-    formatter.options_mut().set_first_operand_char_index(10);
-    
-    let mut instruction = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instruction);
-        let mut output = String::new();
-        formatter.format(&instruction, &mut output);
+    if is_arm64 {
+        for (chunk_idx, chunk) in ep_bytes.chunks_exact(4).enumerate() {
+            let addr = entry_point + (chunk_idx * 4) as u64;
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let is_svc = (word & 0xFFE0_001F) == 0xD400_0001;
+            let hex_bytes = format!("{:02x} {:02x} {:02x} {:02x}", chunk[0], chunk[1], chunk[2], chunk[3]);
 
-        let addr = format!("{:016X}", instruction.ip());
-        let mnemonic_str = output.split_whitespace().next().unwrap_or("").to_string();
-        let rest = output.strip_prefix(&mnemonic_str).unwrap_or("").to_string();
+            let (mnemonic, rest, color) = if is_svc {
+                let imm = (word >> 5) & 0xFFFF;
+                ("svc".to_string(), format!("{:#x}  ; DIRECT SYSCALL", imm), theme::CRITICAL)
+            } else {
+                (".word".to_string(), format!("{:#010x}  [{}]", word, hex_bytes), theme::TEXT)
+            };
 
-        let line = Line::from(vec![
-            Span::styled(format!(" {} ", addr), Style::default().fg(theme::TEXT_DIM)),
-            Span::styled(format!("{:<8}", mnemonic_str), Style::default().fg(theme::INFO).add_modifier(Modifier::BOLD)),
-            Span::styled(rest, Style::default().fg(theme::TEXT)),
-        ]);
-        lines.push(line);
+            let line = Line::from(vec![
+                Span::styled(format!(" {:#010x} ", addr), theme::value()),
+                Span::styled(format!("{:<8}", mnemonic), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(rest, Style::default().fg(if is_svc { theme::CRITICAL } else { theme::TEXT_DIM })),
+            ]);
+            lines.push(line);
+        }
+    } else {
+        let bitness = if is_64bit { 64 } else { 32 };
+        let mut decoder = Decoder::with_ip(bitness, ep_bytes, entry_point, DecoderOptions::NONE);
+        let mut formatter = NasmFormatter::new();
+        formatter.options_mut().set_digit_separator("_");
+        formatter.options_mut().set_first_operand_char_index(10);
+        
+        let mut instruction = Instruction::default();
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instruction);
+            let mut output = String::new();
+            formatter.format(&instruction, &mut output);
+
+            let addr = format!("{:016X}", instruction.ip());
+            let mnemonic_str = output.split_whitespace().next().unwrap_or("").to_string();
+            let rest = output.strip_prefix(&mnemonic_str).unwrap_or("").to_string();
+
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", addr), Style::default().fg(theme::TEXT_DIM)),
+                Span::styled(format!("{:<8}", mnemonic_str), Style::default().fg(theme::INFO).add_modifier(Modifier::BOLD)),
+                Span::styled(rest, Style::default().fg(theme::TEXT)),
+            ]);
+            lines.push(line);
+        }
     }
 
     if lines.len() <= 2 {
@@ -1854,6 +1892,7 @@ fn draw_disasm(frame: &mut Frame, area: Rect, app: &App) {
         "Disassembly",
         &pe.syscall_locations,
         pe.is_64bit,
+        false,
         &pe.ep_bytes,
         pe.entry_point,
     );
@@ -2427,6 +2466,7 @@ fn draw_elf_disasm(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(" No ELF metadata for disassembly"), area);
         return;
     };
+    let is_arm64 = elf.machine.contains("ARM64") || elf.machine.contains("AArch64");
     render_disasm(
         frame,
         area,
@@ -2434,7 +2474,365 @@ fn draw_elf_disasm(frame: &mut Frame, area: Rect, app: &App) {
         "ELF Disassembly",
         &elf.syscall_locations,
         elf.is_64bit,
+        is_arm64,
         &elf.ep_bytes,
         elf.entry_point,
+    );
+}
+
+// ─── Mach-O UI Renderers ─────────────────────────────────────────
+
+fn draw_macho_headers(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(macho) = app.result.macho.as_ref() else {
+        frame.render_widget(Paragraph::new(" No Mach-O headers"), area);
+        return;
+    };
+
+    let block = panel_block("Mach-O Headers & Mitigations");
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::horizontal([
+        Constraint::Percentage(33),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+    ])
+    .split(inner_area);
+
+    // Left Column: Header Information
+    let left_lines = vec![
+        section_header("Mach-O Header"),
+        kv_line("CPU Type", &macho.cpu_type),
+        kv_line("File Type", &macho.file_type),
+        kv_line("Flags", &macho.flags_str),
+        kv_line("Entry Point", &format!("{:#010x}", macho.entry_point)),
+        kv_line("Is 64-bit", &macho.is_64bit.to_string()),
+        kv_line("Is PIE", &macho.is_pie.to_string()),
+        kv_line("Code Signature", if macho.has_code_signature { "Signed (LC_CODE_SIGNATURE)" } else { "Unsigned" }),
+    ];
+
+    // Middle Column: Binary Hardening & Mitigations
+    let fmt_check = |label: &str, ok: bool, ok_text: &str, bad_text: &str, is_crit: bool| {
+        let (icon, text, color) = if ok {
+            ("✓", ok_text, theme::SAFE)
+        } else if is_crit {
+            ("!", bad_text, theme::CRITICAL)
+        } else {
+            ("⚠", bad_text, theme::WARNING)
+        };
+        Line::from(vec![
+            Span::styled(format!("  {:<14} ", label), theme::label()),
+            Span::styled(format!("{} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(text.to_string(), Style::default().fg(color)),
+        ])
+    };
+
+    let mut center_lines = vec![
+        section_header("Mitigations & Hardening"),
+        fmt_check("PIE (ASLR)", macho.mitigations.pie, "Enabled (MH_PIE)", "Disabled (Fixed Base)", false),
+        fmt_check("NX Stack", !macho.mitigations.allow_stack_execution, "Enforced (Non-Exec)", "Disabled (Stack Exec allowed!)", true),
+        fmt_check("Heap NX", macho.mitigations.no_heap_execution, "Enforced (MH_NO_HEAP_EXEC)", "Unrestricted", false),
+        fmt_check("Code Signature", macho.mitigations.has_code_signature, "Present (LC_CODE_SIGNATURE)", "Missing / Unsigned", false),
+    ];
+
+    if !macho.mitigations.rpaths.is_empty() {
+        center_lines.push(Line::from(""));
+        center_lines.push(section_header("RPATHs (Dylib Hijacking Risk)"));
+        for rp in &macho.mitigations.rpaths {
+            center_lines.push(Line::from(vec![
+                Span::styled("  • ", theme::label()),
+                Span::styled(rp, Style::default().fg(theme::WARNING)),
+            ]));
+        }
+    }
+
+    // Right Column: System Calls & Dependent Libraries
+    let mut right_lines = vec![
+        section_header("System Calls"),
+    ];
+    let (sys_icon, sys_text, sys_color) = if macho.direct_syscalls {
+        ("!", format!("FOUND ({} instances)", macho.syscall_locations.len()), theme::CRITICAL)
+    } else {
+        ("✓", "None Detected".to_string(), theme::SAFE)
+    };
+    right_lines.push(Line::from(vec![
+        Span::styled("  Direct Sys:    ", theme::label()),
+        Span::styled(format!("{} ", sys_icon), Style::default().fg(sys_color).add_modifier(Modifier::BOLD)),
+        Span::styled(sys_text, Style::default().fg(sys_color)),
+    ]));
+
+    right_lines.push(Line::from(""));
+    right_lines.push(section_header("Dependent Dylibs (LC_LOAD_DYLIB)"));
+    if macho.dylibs.is_empty() {
+        right_lines.push(Line::from(Span::styled("  (Static binary / No dynamic libs)", Style::default().fg(theme::TEXT_DIM))));
+    } else {
+        for dylib in &macho.dylibs {
+            right_lines.push(Line::from(vec![
+                Span::styled("  • ", theme::label()),
+                Span::styled(dylib, Style::default().fg(theme::INFO)),
+            ]));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(left_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        chunks[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(center_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        chunks[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(right_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        chunks[2],
+    );
+}
+
+fn draw_macho_segments(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(macho) = app.result.macho.as_ref() else {
+        frame.render_widget(Paragraph::new(" No Mach-O segments"), area);
+        return;
+    };
+
+    let header = Row::new(vec![
+        Cell::from("Segment").style(theme::header()),
+        Cell::from("InitProt").style(theme::header()),
+        Cell::from("MaxProt").style(theme::header()),
+        Cell::from("VM Address").style(theme::header()),
+        Cell::from("VM Size").style(theme::header()),
+        Cell::from("File Offset").style(theme::header()),
+        Cell::from("File Size").style(theme::header()),
+    ])
+    .height(1);
+
+    let rows: Vec<Row> = macho
+        .segments
+        .iter()
+        .map(|seg| {
+            let is_wx = seg.is_write && seg.is_exec && seg.filesize > 0;
+            let prot_color = if is_wx {
+                theme::CRITICAL
+            } else if seg.is_exec {
+                theme::WARNING
+            } else {
+                theme::TEXT
+            };
+
+            Row::new(vec![
+                Cell::from(seg.name.clone()).style(theme::value()),
+                Cell::from(seg.initprot.clone()).style(Style::default().fg(prot_color).add_modifier(if is_wx { Modifier::BOLD } else { Modifier::empty() })),
+                Cell::from(seg.maxprot.clone()).style(Style::default().fg(theme::TEXT_DIM)),
+                Cell::from(format!("{:#010x}", seg.vmaddr)).style(theme::value()),
+                Cell::from(format!("{:#x}", seg.vmsize)).style(theme::value()),
+                Cell::from(format!("{:#x}", seg.fileoff)).style(theme::value()),
+                Cell::from(format!("{:#x}", seg.filesize)).style(theme::value()),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Min(12),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(panel_block("Mach-O Segments"))
+        .row_highlight_style(Style::default().bg(theme::BG_PANEL));
+
+    frame.render_widget(table, area);
+}
+
+fn draw_macho_sections(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(macho) = app.result.macho.as_ref() else {
+        frame.render_widget(Paragraph::new(" No Mach-O sections"), area);
+        return;
+    };
+
+    let header = Row::new(vec![
+        Cell::from("Section").style(theme::header()),
+        Cell::from("Segment").style(theme::header()),
+        Cell::from("Addr").style(theme::header()),
+        Cell::from("Size").style(theme::header()),
+        Cell::from("Entropy").style(theme::header()),
+        Cell::from("Flags").style(theme::header()),
+        Cell::from("Anomalies").style(theme::header()),
+    ])
+    .height(1);
+
+    let query_lower = app.search_query.to_lowercase();
+    let rows: Vec<Row> = macho
+        .sections
+        .iter()
+        .filter(|s| query_lower.is_empty() || s.sectname.to_lowercase().contains(&query_lower) || s.segname.to_lowercase().contains(&query_lower))
+        .map(|s| {
+            let ent_color = if s.entropy > 7.0 {
+                theme::CRITICAL
+            } else if s.entropy > 6.0 {
+                theme::WARNING
+            } else {
+                theme::SAFE
+            };
+
+            let is_wx = s.is_executable && s.is_writable;
+            let (flags_str, flag_color) = if is_wx {
+                ("W+X", theme::CRITICAL)
+            } else if s.is_executable {
+                ("X", theme::WARNING)
+            } else if s.is_writable {
+                ("W", theme::TEXT)
+            } else {
+                ("R", theme::TEXT_DIM)
+            };
+
+            let anomaly_str = if s.anomalies.is_empty() {
+                "—".to_string()
+            } else {
+                s.anomalies.join(", ")
+            };
+
+            Row::new(vec![
+                Cell::from(s.sectname.clone()).style(theme::value()),
+                Cell::from(s.segname.clone()).style(Style::default().fg(theme::TEXT_DIM)),
+                Cell::from(format!("{:#010x}", s.addr)).style(theme::value()),
+                Cell::from(format!("{:#x}", s.size)).style(theme::value()),
+                Cell::from(format!("{:.2}", s.entropy)).style(Style::default().fg(ent_color)),
+                Cell::from(flags_str).style(Style::default().fg(flag_color).add_modifier(if is_wx { Modifier::BOLD } else { Modifier::empty() })),
+                Cell::from(anomaly_str).style(Style::default().fg(theme::WARNING)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(18),
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(panel_block("Mach-O Sections"))
+        .row_highlight_style(Style::default().bg(theme::BG_PANEL));
+
+    frame.render_widget(table, area);
+}
+
+fn draw_macho_imports(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(macho) = app.result.macho.as_ref() else {
+        frame.render_widget(Paragraph::new(" No Mach-O symbols"), area);
+        return;
+    };
+
+    let mut lines = Vec::new();
+
+    let crit = macho.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Critical).count();
+    let high = macho.imported_symbols.iter().filter(|f| f.risk == ApiRisk::High).count();
+    let med = macho.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Medium).count();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} Imported Symbols across {} Dylibs  ", macho.imported_symbols.len(), macho.dylibs.len()),
+            theme::value(),
+        ),
+        Span::styled(format!("● {} ", crit), Style::default().fg(theme::CRITICAL)),
+        Span::styled(format!("● {} ", high), Style::default().fg(theme::ORANGE)),
+        Span::styled(format!("● {} ", med), Style::default().fg(theme::WARNING)),
+    ]));
+    lines.push(Line::from(""));
+
+    if !macho.dylibs.is_empty() {
+        lines.push(section_header("Dependent Dynamic Libraries (LC_LOAD_DYLIB)"));
+        for lib in &macho.dylibs {
+            lines.push(Line::from(vec![
+                Span::styled("   ▸ ", Style::default().fg(theme::ORANGE_LIGHT)),
+                Span::styled(lib, Style::default().fg(theme::INFO)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    let query_lower = app.search_query.to_lowercase();
+    lines.push(section_header("Imported Dynamic Symbols"));
+    for sym in macho
+        .imported_symbols
+        .iter()
+        .filter(|s| query_lower.is_empty() || s.name.to_lowercase().contains(&query_lower))
+    {
+        let color = theme::api_risk_color(&sym.risk);
+        let marker = match sym.risk {
+            ApiRisk::Critical => "●",
+            ApiRisk::High => "◉",
+            ApiRisk::Medium => "○",
+            _ => "·",
+        };
+        let risk_tag = if sym.risk != ApiRisk::None {
+            format!(" [{}]", sym.risk)
+        } else {
+            String::new()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {} ", marker), Style::default().fg(color)),
+            Span::styled(&sym.name, Style::default().fg(theme::TEXT)),
+            Span::styled(risk_tag, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    if !macho.exported_symbols.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Exported Symbols"));
+        for exp in &macho.exported_symbols {
+            if query_lower.is_empty() || exp.to_lowercase().contains(&query_lower) {
+                lines.push(Line::from(vec![
+                    Span::styled("    ▸ ", Style::default().fg(theme::ORANGE_LIGHT)),
+                    Span::styled(exp, Style::default().fg(theme::TEXT)),
+                ]));
+            }
+        }
+    }
+
+    let block = panel_block("Mach-O Symbols & Imports");
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll_offset, 0)),
+        area,
+    );
+}
+
+fn draw_macho_disasm(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(macho) = app.result.macho.as_ref() else {
+        frame.render_widget(Paragraph::new(" No Mach-O metadata for disassembly"), area);
+        return;
+    };
+    let is_arm64 = macho.cpu_type.contains("ARM64") || macho.cpu_type.contains("AArch64");
+    render_disasm(
+        frame,
+        area,
+        app.scroll_offset,
+        "Mach-O Disassembly",
+        &macho.syscall_locations,
+        macho.is_64bit,
+        is_arm64,
+        &macho.ep_bytes,
+        macho.entry_point,
     );
 }

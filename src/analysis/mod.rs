@@ -1,6 +1,7 @@
 pub mod basic;
 pub mod pe;
 pub mod elf;
+pub mod macho;
 
 use crate::models::*;
 use color_eyre::Result;
@@ -27,7 +28,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
     };
 
     let data_ref = &data;
-    let (basic_result, entropy_graph, pe_result, elf_result, yara_matches) = std::thread::scope(|s| {
+    let (basic_result, entropy_graph, pe_result, elf_result, macho_result, yara_matches) = std::thread::scope(|s| {
         let tx1 = progress_tx.clone();
         let basic_handle = s.spawn(move || {
             let res = basic::analyze(data_ref);
@@ -44,13 +45,14 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
         let tx3 = progress_tx.clone();
         let binary_handle = s.spawn(move || {
-            let (pe, elf) = match file_type {
-                FileType::PE => (pe::analyze(data_ref).ok(), None),
-                FileType::ELF => (None, elf::analyze(data_ref).ok()),
-                _ => (None, None),
+            let (pe, elf, macho) = match file_type {
+                FileType::PE => (pe::analyze(data_ref).ok(), None, None),
+                FileType::ELF => (None, elf::analyze(data_ref).ok(), None),
+                FileType::MachO => (None, None, macho::analyze(data_ref).ok()),
+                _ => (None, None, None),
             };
             if let Some(tx) = &tx3 { let _ = tx.send(()); }
-            (pe, elf)
+            (pe, elf, macho)
         });
 
         let yara_handle = if run_yara {
@@ -66,14 +68,14 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
         let basic = basic_handle.join().unwrap();
         let entropy = entropy_handle.join().unwrap();
-        let (pe, elf) = binary_handle.join().unwrap();
+        let (pe, elf, macho) = binary_handle.join().unwrap();
         let yara = if let Some(h) = yara_handle {
             h.join().unwrap()
         } else {
             Vec::new()
         };
 
-        (basic, entropy, pe, elf, yara)
+        (basic, entropy, pe, elf, macho, yara)
     });
 
     let mut pe_result = pe_result;
@@ -152,16 +154,17 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         }
     }
 
-    let detection_checks = build_detection_checks(&basic_result, &pe_result, &elf_result, file_info.size);
+    let detection_checks = build_detection_checks(&basic_result, &pe_result, &elf_result, &macho_result, file_info.size);
     let (risk_score, risk_level) = compute_risk_from_checks(&detection_checks, &yara_matches);
-    let risk_breakdown = compute_risk_breakdown(&basic_result, &pe_result, &elf_result);
-    let malware_pattern = detect_malware_pattern(&basic_result, &pe_result, &elf_result);
+    let risk_breakdown = compute_risk_breakdown(&basic_result, &pe_result, &elf_result, &macho_result);
+    let malware_pattern = detect_malware_pattern(&basic_result, &pe_result, &elf_result, &macho_result);
 
     Ok(AnalysisResult {
         file_info,
         basic: basic_result,
         pe: pe_result,
         elf: elf_result,
+        macho: macho_result,
         risk_score,
         risk_level,
         risk_breakdown,
@@ -307,7 +310,11 @@ fn detect_type(magic: &[u8]) -> FileType {
         && ((magic[0..4] == [0xFE, 0xED, 0xFA, 0xCE])
             || (magic[0..4] == [0xFE, 0xED, 0xFA, 0xCF])
             || (magic[0..4] == [0xCE, 0xFA, 0xED, 0xFE])
-            || (magic[0..4] == [0xCF, 0xFA, 0xED, 0xFE]))
+            || (magic[0..4] == [0xCF, 0xFA, 0xED, 0xFE])
+            || (magic[0..4] == [0xCA, 0xFE, 0xBA, 0xBE])
+            || (magic[0..4] == [0xBE, 0xBA, 0xFE, 0xCA])
+            || (magic[0..4] == [0xCA, 0xFE, 0xBA, 0xBF])
+            || (magic[0..4] == [0xBF, 0xBA, 0xFE, 0xCA]))
     {
         FileType::MachO
     } else {
@@ -363,7 +370,7 @@ pub fn compute_risk_from_checks(checks: &[DetectionCheck], yara_matches: &[Strin
     (score, level)
 }
 
-fn compute_risk_breakdown(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>) -> RiskBreakdown {
+fn compute_risk_breakdown(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>) -> RiskBreakdown {
     let entropy_score = if basic.entropy > 7.5 {
         25
     } else if basic.entropy > 7.0 {
@@ -421,6 +428,22 @@ fn compute_risk_breakdown(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
                 AnomalySeverity::Info => {}
             }
         }
+    } else if let Some(macho) = macho {
+        for func in &macho.imported_symbols {
+            match func.risk {
+                ApiRisk::Critical => api_score += 8,
+                ApiRisk::High => api_score += 4,
+                ApiRisk::Medium => api_score += 1,
+                _ => {}
+            }
+        }
+        for a in &macho.anomalies {
+            match a.severity {
+                AnomalySeverity::Critical => anomaly_score += 12,
+                AnomalySeverity::Warning => anomaly_score += 4,
+                AnomalySeverity::Info => {}
+            }
+        }
     }
 
     RiskBreakdown {
@@ -434,7 +457,7 @@ fn compute_risk_breakdown(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
 
 // ─── Detection checks ───────────────────────────────────────────
 
-fn has_imported_api(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, names: &[&str]) -> bool {
+fn has_imported_api(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>, names: &[&str]) -> bool {
     if let Some(pe) = pe {
         if pe.imports.iter().any(|dll| {
             dll.functions.iter().any(|f| {
@@ -451,10 +474,18 @@ fn has_imported_api(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, names: &
             return true;
         }
     }
+    if let Some(macho) = macho {
+        if macho.imported_symbols.iter().any(|f| {
+            let clean = f.name.strip_prefix('_').unwrap_or(&f.name);
+            names.iter().any(|n| clean.eq_ignore_ascii_case(n) || f.name.eq_ignore_ascii_case(n))
+        }) {
+            return true;
+        }
+    }
     false
 }
 
-fn has_all_imported_apis(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, names: &[&str]) -> bool {
+fn has_all_imported_apis(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>, names: &[&str]) -> bool {
     if let Some(pe) = pe {
         names.iter().all(|name| {
             pe.imports.iter().any(|dll| {
@@ -465,13 +496,20 @@ fn has_all_imported_apis(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, nam
         names.iter().all(|name| {
             elf.imported_symbols.iter().any(|f| f.name.eq_ignore_ascii_case(name))
         })
+    } else if let Some(macho) = macho {
+        names.iter().all(|name| {
+            macho.imported_symbols.iter().any(|f| {
+                let clean = f.name.strip_prefix('_').unwrap_or(&f.name);
+                clean.eq_ignore_ascii_case(name) || f.name.eq_ignore_ascii_case(name)
+            })
+        })
     } else {
         false
     }
 }
 
-fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
-    let mut checks = Vec::with_capacity(35);
+fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
+    let mut checks = Vec::with_capacity(40);
 
     let has_category = |cat: &StringCategory| basic.strings.iter().any(|s| &s.category == cat);
     let has_non_normal = basic
@@ -479,8 +517,8 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
         .iter()
         .any(|s| !matches!(s.category, StringCategory::Normal));
 
-    let has_api = |names: &[&str]| has_imported_api(pe, elf, names);
-    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, names);
+    let has_api = |names: &[&str]| has_imported_api(pe, elf, macho, names);
+    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, macho, names);
 
     // 1. High entropy (>7.0)
     checks.push(DetectionCheck {
@@ -902,6 +940,41 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
         });
     }
 
+    // ─── Mach-O-Specific Detection Checks ───
+    if let Some(macho) = macho {
+        let has_wx_seg = macho.segments.iter().any(|s| s.is_write && s.is_exec && s.filesize > 0);
+        let has_wx_sec = macho.sections.iter().any(|s| s.is_writable && s.is_executable);
+        checks.push(DetectionCheck {
+            name: "W+X Segment / Section (Mach-O)".into(),
+            triggered: has_wx_seg || has_wx_sec,
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Executable Stack (Mach-O)".into(),
+            triggered: macho.mitigations.allow_stack_execution,
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Direct Syscalls (Mach-O)".into(),
+            triggered: macho.direct_syscalls,
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Task Port Tampering / Injection (macOS)".into(),
+            triggered: has_api(&["task_for_pid", "mach_vm_write", "mach_vm_protect", "thread_create_running"]),
+            severity: DetectionSeverity::Critical,
+        });
+
+        checks.push(DetectionCheck {
+            name: "Unsigned Mach-O Binary".into(),
+            triggered: !macho.has_code_signature,
+            severity: DetectionSeverity::Medium,
+        });
+    }
+
     checks
 }
 
@@ -911,9 +984,10 @@ fn detect_malware_pattern(
     basic: &BasicAnalysis,
     pe: &Option<PeAnalysis>,
     elf: &Option<ElfAnalysis>,
+    macho: &Option<MachoAnalysis>,
 ) -> Option<MalwarePattern> {
-    let has_api = |names: &[&str]| has_imported_api(pe, elf, names);
-    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, names);
+    let has_api = |names: &[&str]| has_imported_api(pe, elf, macho, names);
+    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, macho, names);
 
     let has_category = |cat: &StringCategory| basic.strings.iter().any(|s| &s.category == cat);
 
@@ -1010,6 +1084,49 @@ fn detect_malware_pattern(
                 matched_indicators: vec![
                     "Network socket APIs".into(),
                     format!("Architecture: {}", elf_info.machine),
+                ],
+            });
+        }
+    }
+
+    // ─── macOS-specific Malware Patterns ───
+    if let Some(_macho_info) = macho {
+        // macOS.Spyware
+        let spy_apis = has_api(&["CGEventTapCreate", "IOHIDManagerOpen", "CGWindowListCreateImage"]);
+        if spy_apis {
+            return Some(MalwarePattern {
+                family: "Spyware.macOS".into(),
+                confidence: "High".into(),
+                description: "Input event tapping or screen capture activity detected".into(),
+                matched_indicators: vec![
+                    "EventTap or Screen Capture API (CGEventTapCreate/CGWindowListCreateImage)".into(),
+                ],
+            });
+        }
+
+        // macOS.Stealer
+        let stealer_apis = has_api(&["SecKeychainItemCopyAttributesAndData", "SecItemCopyMatching"]);
+        let stealer_strings = has_string_containing(&["keychain", "cookies.binarycookies", "tcc.db"]);
+        if stealer_apis || stealer_strings {
+            return Some(MalwarePattern {
+                family: "Stealer.macOS".into(),
+                confidence: "High".into(),
+                description: "Keychain, credential database, or TCC database access detected".into(),
+                matched_indicators: vec![
+                    if stealer_apis { "Keychain access API".into() } else { "macOS sensitive file path in strings".into() },
+                ],
+            });
+        }
+
+        // macOS.Injector
+        let inject_apis = has_api(&["task_for_pid", "mach_vm_write", "NSCreateObjectFileImageFromMemory"]);
+        if inject_apis {
+            return Some(MalwarePattern {
+                family: "Injector.macOS".into(),
+                confidence: "High".into(),
+                description: "Mach task port manipulation or in-memory bundle loading detected".into(),
+                matched_indicators: vec![
+                    "Mach task or bundle API (task_for_pid/NSCreateObjectFileImageFromMemory)".into(),
                 ],
             });
         }

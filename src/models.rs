@@ -10,6 +10,7 @@ pub struct AnalysisResult {
     pub basic: BasicAnalysis,
     pub pe: Option<PeAnalysis>,
     pub elf: Option<ElfAnalysis>,
+    pub macho: Option<MachoAnalysis>,
     pub risk_score: u32,
     pub risk_level: RiskLevel,
     pub risk_breakdown: RiskBreakdown,
@@ -412,4 +413,64 @@ pub struct MalwarePattern {
     pub confidence: String,
     pub description: String,
     pub matched_indicators: Vec<String>,
+}
+
+// ─── Mach-O analysis ─────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoAnalysis {
+    pub cpu_type: String,
+    pub file_type: String,
+    pub flags_str: String,
+    pub entry_point: u64,
+    pub is_64bit: bool,
+    pub is_pie: bool,
+    pub segments: Vec<MachoSegment>,
+    pub sections: Vec<MachoSection>,
+    pub dylibs: Vec<String>,
+    pub rpaths: Vec<String>,
+    pub imported_symbols: Vec<ImportFunction>,
+    pub exported_symbols: Vec<String>,
+    pub mitigations: MachoMitigations,
+    pub anomalies: Vec<Anomaly>,
+    pub has_code_signature: bool,
+    pub ep_bytes: Vec<u8>,
+    pub direct_syscalls: bool,
+    pub syscall_locations: Vec<SyscallLocation>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoSegment {
+    pub name: String,
+    pub vmaddr: u64,
+    pub vmsize: u64,
+    pub fileoff: u64,
+    pub filesize: u64,
+    pub maxprot: String,
+    pub initprot: String,
+    pub is_read: bool,
+    pub is_write: bool,
+    pub is_exec: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoSection {
+    pub sectname: String,
+    pub segname: String,
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u64,
+    pub entropy: f64,
+    pub is_executable: bool,
+    pub is_writable: bool,
+    pub anomalies: Vec<String>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoMitigations {
+    pub pie: bool,
+    pub allow_stack_execution: bool,
+    pub no_heap_execution: bool,
+    pub has_code_signature: bool,
+    pub rpaths: Vec<String>,
 }
