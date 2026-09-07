@@ -139,22 +139,48 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
 // ─── Status bar ──────────────────────────────────────────────────
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![
-        Span::styled(" ←/→ ", Style::default().fg(theme::ORANGE)),
-        Span::styled("Tab  ", Style::default().fg(theme::TEXT_DIM)),
-        Span::styled("↑/↓ ", Style::default().fg(theme::ORANGE)),
-        Span::styled("Scroll  ", Style::default().fg(theme::TEXT_DIM)),
-        Span::styled("Home ", Style::default().fg(theme::ORANGE)),
-        Span::styled("Top  ", Style::default().fg(theme::TEXT_DIM)),
-    ];
+    let mut spans = Vec::new();
 
-    if app.result.pe.as_ref().map_or(false, |pe| pe.embedded_pe.is_some()) {
-        spans.push(Span::styled("e ", Style::default().fg(theme::ORANGE)));
-        spans.push(Span::styled("Toggle PE  ", Style::default().fg(theme::TEXT_DIM)));
+    if app.is_searching {
+        spans.push(Span::styled(" Search: /", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(&app.search_query, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled("█  ", Style::default().fg(theme::ORANGE)));
+        spans.push(Span::styled("[Enter: Apply, Esc: Cancel]", Style::default().fg(theme::TEXT_DIM)));
+    } else {
+        if let Some((ref msg, instant)) = app.status_message {
+            if instant.elapsed().as_secs() < 3 {
+                spans.push(Span::styled(format!(" ✓ {}  ", msg), Style::default().fg(theme::SAFE).add_modifier(Modifier::BOLD)));
+            }
+        }
+
+        if !app.search_query.is_empty() {
+            spans.push(Span::styled(" Filter: ", Style::default().fg(theme::WARNING)));
+            spans.push(Span::styled(format!("\"{}\" ", app.search_query), Style::default().fg(theme::TEXT)));
+            spans.push(Span::styled("(Esc to clear)  ", Style::default().fg(theme::TEXT_DIM)));
+        }
+
+        spans.push(Span::styled("←/→ ", Style::default().fg(theme::ORANGE)));
+        spans.push(Span::styled("Tab  ", Style::default().fg(theme::TEXT_DIM)));
+        spans.push(Span::styled("↑/↓ ", Style::default().fg(theme::ORANGE)));
+        spans.push(Span::styled("Scroll  ", Style::default().fg(theme::TEXT_DIM)));
+        spans.push(Span::styled("/ ", Style::default().fg(theme::ORANGE)));
+        spans.push(Span::styled("Search  ", Style::default().fg(theme::TEXT_DIM)));
+        spans.push(Span::styled("y ", Style::default().fg(theme::ORANGE)));
+        spans.push(Span::styled("Copy  ", Style::default().fg(theme::TEXT_DIM)));
+
+        if app.current_tab_name() == "Strings" {
+            spans.push(Span::styled("u/i/r/c/s/a ", Style::default().fg(theme::ORANGE)));
+            spans.push(Span::styled("Category  ", Style::default().fg(theme::TEXT_DIM)));
+        }
+
+        if app.result.pe.as_ref().map_or(false, |pe| pe.embedded_pe.is_some()) {
+            spans.push(Span::styled("e ", Style::default().fg(theme::ORANGE)));
+            spans.push(Span::styled("Toggle PE  ", Style::default().fg(theme::TEXT_DIM)));
+        }
+
+        spans.push(Span::styled("q ", Style::default().fg(theme::ORANGE)));
+        spans.push(Span::styled("Quit", Style::default().fg(theme::TEXT_DIM)));
     }
-
-    spans.push(Span::styled("q ", Style::default().fg(theme::ORANGE)));
-    spans.push(Span::styled("Quit", Style::default().fg(theme::TEXT_DIM)));
 
     let help = Line::from(spans);
     frame.render_widget(
@@ -1250,9 +1276,11 @@ fn draw_sections(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .height(1);
 
+    let query_lower = app.search_query.to_lowercase();
     let rows: Vec<Row> = pe
         .sections
         .iter()
+        .filter(|s| query_lower.is_empty() || s.name.to_lowercase().contains(&query_lower))
         .map(|s| {
             let ent_color = if s.entropy > 7.0 {
                 theme::CRITICAL
@@ -1346,8 +1374,16 @@ fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
     ]));
     lines.push(Line::from(""));
 
+    let query_lower = app.search_query.to_lowercase();
+
     // Obfuscated / Dynamically Resolved APIs
-    if !pe.obfuscated_apis.is_empty() {
+    let matching_obf: Vec<&String> = pe
+        .obfuscated_apis
+        .iter()
+        .filter(|api| query_lower.is_empty() || api.to_lowercase().contains(&query_lower))
+        .collect();
+
+    if !matching_obf.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(
                 " ⚠  Obfuscated / Dynamically Resolved APIs (Suspicious)",
@@ -1356,7 +1392,7 @@ fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-        for api in &pe.obfuscated_apis {
+        for api in matching_obf {
             lines.push(Line::from(vec![
                 Span::styled("    ◉ ", Style::default().fg(theme::CRITICAL)),
                 Span::styled(api, Style::default().fg(theme::TEXT)),
@@ -1373,6 +1409,20 @@ fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
 
     // Per-DLL listing
     for dll in &pe.imports {
+        let matching_funcs: Vec<&ImportFunction> = dll
+            .functions
+            .iter()
+            .filter(|func| {
+                query_lower.is_empty()
+                    || func.name.to_lowercase().contains(&query_lower)
+                    || dll.name.to_lowercase().contains(&query_lower)
+            })
+            .collect();
+
+        if matching_funcs.is_empty() {
+            continue;
+        }
+
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" ▸ {} ", dll.name),
@@ -1381,12 +1431,12 @@ fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("({})", dll.functions.len()),
+                format!("({}/{})", matching_funcs.len(), dll.functions.len()),
                 Style::default().fg(theme::TEXT_DIM),
             ),
         ]));
 
-        for func in &dll.functions {
+        for func in matching_funcs {
             let color = theme::api_risk_color(&func.risk);
             let marker = match func.risk {
                 ApiRisk::Critical => "●",
@@ -1427,25 +1477,69 @@ fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_strings(frame: &mut Frame, area: Rect, app: &App) {
     let strings = &app.result.basic.strings;
+    let query_lower = app.search_query.to_lowercase();
+    let cat_filter = app.string_category_filter.as_ref();
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {} strings extracted", strings.len()),
-            theme::value(),
-        ),
-    ]));
-    lines.push(Line::from(""));
+    let mut filtered: Vec<&ExtractedString> = strings
+        .iter()
+        .filter(|s| {
+            if let Some(cat) = cat_filter {
+                if s.category != *cat {
+                    return false;
+                }
+            }
+            if !query_lower.is_empty() {
+                let match_val = s.value.to_lowercase().contains(&query_lower);
+                let match_dec = s.decoded.as_ref().map_or(false, |d| d.to_lowercase().contains(&query_lower));
+                if !match_val && !match_dec {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
 
-    // Show suspicious/interesting strings first, then normal
-    let mut sorted: Vec<&ExtractedString> = strings.iter().collect();
-    sorted.sort_by(|a, b| {
+    filtered.sort_by(|a, b| {
         let a_pri = category_priority(&a.category);
         let b_pri = category_priority(&b.category);
         a_pri.cmp(&b_pri)
     });
 
-    for s in sorted.iter().take(500) {
+    let mut header_spans = vec![
+        Span::styled(
+            format!(" Showing {}/{} strings  |  Filters: ", filtered.len(), strings.len()),
+            theme::label(),
+        ),
+    ];
+
+    let cats = [
+        (None, "a", "All"),
+        (Some(StringCategory::Url), "u", "URL"),
+        (Some(StringCategory::IpAddress), "i", "IP"),
+        (Some(StringCategory::RegistryKey), "r", "Reg"),
+        (Some(StringCategory::Command), "c", "Cmd"),
+        (Some(StringCategory::Suspicious), "s", "Sus"),
+        (Some(StringCategory::FilePath), "p", "Path"),
+    ];
+
+    for (cat, key, name) in cats {
+        let is_active = cat_filter == cat.as_ref();
+        let (bracket_col, text_col) = if is_active {
+            (theme::ORANGE, theme::ORANGE_LIGHT)
+        } else {
+            (theme::BORDER, theme::TEXT_DIM)
+        };
+        header_spans.push(Span::styled("[", Style::default().fg(bracket_col)));
+        header_spans.push(Span::styled(key, Style::default().fg(theme::ORANGE)));
+        header_spans.push(Span::styled(format!(":{}", name), Style::default().fg(text_col)));
+        header_spans.push(Span::styled("] ", Style::default().fg(bracket_col)));
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(header_spans));
+    lines.push(Line::from(""));
+
+    for s in filtered.iter().take(500) {
         let cat_color = match s.category {
             StringCategory::Url => theme::CRITICAL,
             StringCategory::IpAddress => theme::ORANGE,
@@ -2198,9 +2292,11 @@ fn draw_elf_sections(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .height(1);
 
+    let query_lower = app.search_query.to_lowercase();
     let rows: Vec<Row> = elf
         .sections
         .iter()
+        .filter(|s| query_lower.is_empty() || s.name.to_lowercase().contains(&query_lower))
         .map(|s| {
             let ent_color = if s.entropy > 7.0 {
                 theme::CRITICAL
@@ -2289,8 +2385,13 @@ fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
     }
 
+    let query_lower = app.search_query.to_lowercase();
     lines.push(section_header("Imported Dynamic Symbols"));
-    for sym in &elf.imported_symbols {
+    for sym in elf
+        .imported_symbols
+        .iter()
+        .filter(|s| query_lower.is_empty() || s.name.to_lowercase().contains(&query_lower))
+    {
         let color = theme::api_risk_color(&sym.risk);
         let marker = match sym.risk {
             ApiRisk::Critical => "●",

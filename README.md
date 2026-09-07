@@ -65,7 +65,11 @@ cargo run --release -- <path/to/binary.exe>
 - `Shift+Tab` / `Left Arrow`: Previous Tab
 - `Up` / `Down` / `k` / `j`: Scroll
 - `PageUp` / `PageDown`: Fast Scroll
-- `q` / `Esc`: Quit
+- `/`: Interactive Search (live filter across Strings, Imports, Sections)
+- `y`: Copy to Clipboard (OSC 52 - copies active hash or string)
+- `u` / `i` / `r` / `c` / `s` / `p` / `a`: Quick category filter in Strings view (URLs, IPs, Reg, Cmd, Suspicious, Path, All)
+- `Esc`: Clear search / category filter (or Quit if clean)
+- `q`: Quit
 
 ## Dependencies
 

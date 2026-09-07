@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Interactive Search (`/`)**:
+  - Implemented live substring filtering across Strings, Imports, Sections, and ELF Symbols tabs.
+  - Added dedicated status bar input prompt (`/query█`), with `Enter` to apply filter and `Esc` to cancel/clear.
+- **Strings Category Filters**:
+  - Added single-key category toggles in the Strings view: `u` (URLs), `i` (IPs), `r` (Registry keys), `c` (Commands), `s` (Suspicious), `p` (File paths), and `a` (All).
+  - Added interactive category filter bar in the Strings tab header displaying active filters and matching counts.
+- **OSC 52 Clipboard Copy (`y`)**:
+  - Implemented zero-dependency clipboard copying via standard ANSI OSC 52 escape sequences (`\x1b]52;c;...`).
+  - Context-aware copying: copies active hashes (SHA-256, Imphash, RichPE) or filtered strings, displaying temporary confirmation toasts.
 - **UTF-16LE Wide String Extraction**:
   - Implemented dual-alignment UTF-16LE string scanner detecting wide string sequences alongside standard ASCII.
   - Added automatic overlap detection and trimming between adjacent ASCII and wide strings.
