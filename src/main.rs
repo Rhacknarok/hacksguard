@@ -39,30 +39,13 @@ fn main() -> Result<()> {
         let data = std::fs::read(&cli.file).unwrap_or_default();
         let parent_is_pe = result.pe.is_some();
         if let Some(pe) = analysis::find_embedded_pe(&data, parent_is_pe) {
-            result.detection_checks.push(crate::models::DetectionCheck {
-                name: "Embedded PE executable found".into(),
-                triggered: true,
-                severity: crate::models::DetectionSeverity::Critical,
-            });
-
-            if result.pe.is_some() {
-                result.pe.as_mut().unwrap().embedded_pe = Some(Box::new(pe));
-            } else {
-                result.pe = Some(pe);
-            }
-
-            let (score, level) = crate::analysis::compute_risk_from_checks(
-                &result.detection_checks,
-                &result.yara_matches,
-            );
-            result.risk_score = score;
-            result.risk_level = level;
+            result.attach_embedded_pe(pe);
         }
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
 
-    let mut terminal = tui::init();
+    let mut terminal = ratatui::init();
 
     let (tx, rx) = std::sync::mpsc::channel();
     let (prog_tx, prog_rx) = std::sync::mpsc::channel();
@@ -121,7 +104,7 @@ fn main() -> Result<()> {
         if crossterm::event::poll(std::time::Duration::from_millis(0))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.code == crossterm::event::KeyCode::Char('q') || key.code == crossterm::event::KeyCode::Esc {
-                    tui::restore();
+                    ratatui::restore();
                     std::process::exit(0);
                 }
             }
@@ -154,6 +137,6 @@ fn main() -> Result<()> {
     app.embedded_pe_loading = true;
 
     let res = app.run(&mut terminal);
-    tui::restore();
+    ratatui::restore();
     res
 }

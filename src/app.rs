@@ -22,40 +22,21 @@ pub struct App {
 
 impl App {
     pub fn new(result: AnalysisResult) -> Self {
-        let mut tab_names = vec!["Overview".to_string()];
-        if let Some(ref pe) = result.pe {
-            tab_names.push("Headers".into());
-            tab_names.push("Sections".into());
-            tab_names.push("Imports".into());
-            tab_names.push("Disasm".into());
-            if pe.manifest.is_some() {
-                tab_names.push("Manifest".into());
-            }
-        } else if result.elf.is_some() {
-            tab_names.push("Headers".into());
-            tab_names.push("Segments".into());
-            tab_names.push("Sections".into());
-            tab_names.push("Imports".into());
-            tab_names.push("Disasm".into());
-        }
-        tab_names.push("Hex View".into());
-        tab_names.push("Strings".into());
-        tab_names.push("Entropy".into());
-        tab_names.push("Guide".into());
-
-        Self {
+        let mut app = Self {
             result,
             current_tab: 0,
             scroll_offset: 0,
             should_quit: false,
-            tab_names,
+            tab_names: Vec::new(),
             yara_rx: None,
             yara_loading: false,
             embedded_pe_rx: None,
             embedded_pe_loading: false,
             inspect_embedded: false,
             spinner_tick: 0,
-        }
+        };
+        app.rebuild_tabs();
+        app
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -85,28 +66,8 @@ impl App {
                     if let Ok(opt_pe) = rx.try_recv() {
                         self.embedded_pe_loading = false;
                         if let Some(pe) = opt_pe {
-                            // Add check
-                            self.result.detection_checks.push(crate::models::DetectionCheck {
-                                name: "Embedded PE executable found".into(),
-                                triggered: true,
-                                severity: crate::models::DetectionSeverity::Critical,
-                            });
-
-                            if self.result.pe.is_some() {
-                                self.result.pe.as_mut().unwrap().embedded_pe = Some(Box::new(pe));
-                            } else {
-                                self.result.pe = Some(pe);
-                            }
-
+                            self.result.attach_embedded_pe(pe);
                             self.rebuild_tabs();
-
-                            // Recompute risk score and level dynamically
-                            let (score, level) = crate::analysis::compute_risk_from_checks(
-                                &self.result.detection_checks,
-                                &self.result.yara_matches,
-                            );
-                            self.result.risk_score = score;
-                            self.result.risk_level = level;
                         }
                     }
                 }

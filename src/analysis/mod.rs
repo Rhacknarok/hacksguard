@@ -154,7 +154,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
     let detection_checks = build_detection_checks(&basic_result, &pe_result, &elf_result, file_info.size);
     let (risk_score, risk_level) = compute_risk_from_checks(&detection_checks, &yara_matches);
-    let (_, _, risk_breakdown) = compute_risk(&basic_result, &pe_result, &elf_result);
+    let risk_breakdown = compute_risk_breakdown(&basic_result, &pe_result, &elf_result);
     let malware_pattern = detect_malware_pattern(&basic_result, &pe_result, &elf_result);
 
     Ok(AnalysisResult {
@@ -199,36 +199,16 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
 
 const YARA_CACHE_PATH: &str = ".yara_cache";
 
-fn get_rules_dir() -> std::path::PathBuf {
-    let cwd_rules = std::path::Path::new("rules");
-    if cwd_rules.is_dir() {
-        return cwd_rules.to_path_buf();
+fn resolve_app_path(name: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(name);
+    if p.exists() {
+        return p.to_path_buf();
     }
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            let exe_rules = parent.join("rules");
-            if exe_rules.is_dir() {
-                return exe_rules;
-            }
-        }
-    }
-    std::path::PathBuf::from("rules")
-}
-
-fn get_cache_path() -> std::path::PathBuf {
-    let cwd_cache = std::path::Path::new(YARA_CACHE_PATH);
-    if cwd_cache.exists() {
-        return cwd_cache.to_path_buf();
-    }
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            let exe_cache = parent.join(YARA_CACHE_PATH);
-            if exe_cache.exists() {
-                return exe_cache;
-            }
-        }
-    }
-    std::path::PathBuf::from(YARA_CACHE_PATH)
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| p.to_path_buf())
 }
 
 fn visit_dirs(dir: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
@@ -274,8 +254,8 @@ fn compute_rules_fingerprint(rules_dir: &std::path::Path) -> Vec<u8> {
 ///
 /// Cache format: [32 bytes fingerprint][boreal-serialized Scanner]
 pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
-    let rules_dir = get_rules_dir();
-    let cache_path = get_cache_path();
+    let rules_dir = resolve_app_path("rules");
+    let cache_path = resolve_app_path(YARA_CACHE_PATH);
     let fingerprint = compute_rules_fingerprint(&rules_dir);
 
     // Try loading from cache
@@ -383,10 +363,7 @@ pub fn compute_risk_from_checks(checks: &[DetectionCheck], yara_matches: &[Strin
     (score, level)
 }
 
-fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>) -> (u32, RiskLevel, RiskBreakdown) {
-    let mut score: u32 = 0;
-
-    // Entropy
+fn compute_risk_breakdown(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>) -> RiskBreakdown {
     let entropy_score = if basic.entropy > 7.5 {
         25
     } else if basic.entropy > 7.0 {
@@ -396,23 +373,17 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<Elf
     } else {
         0
     };
-    score += entropy_score;
 
-    // Packing
     let is_packed = basic.is_packed || pe.as_ref().map_or(false, |p| p.packer_detected.is_some()) || elf.as_ref().map_or(false, |e| e.packer_detected.is_some());
     let packing_score = if is_packed { 15 } else { 0 };
-    score += packing_score;
 
-    // Suspicious strings
     let sus = basic
         .strings
         .iter()
         .filter(|s| !matches!(s.category, StringCategory::Normal))
         .count() as u32;
     let string_score = sus.min(15);
-    score += string_score;
 
-    // API risk + anomalies (PE or ELF)
     let mut api_score: u32 = 0;
     let mut anomaly_score: u32 = 0;
 
@@ -427,9 +398,6 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<Elf
                 }
             }
         }
-        api_score = api_score.min(25);
-        score += api_score;
-
         for a in &pe.anomalies {
             match a.severity {
                 AnomalySeverity::Critical => anomaly_score += 12,
@@ -437,8 +405,6 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<Elf
                 AnomalySeverity::Info => {}
             }
         }
-        anomaly_score = anomaly_score.min(25);
-        score += anomaly_score;
     } else if let Some(elf) = elf {
         for func in &elf.imported_symbols {
             match func.risk {
@@ -448,9 +414,6 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<Elf
                 _ => {}
             }
         }
-        api_score = api_score.min(25);
-        score += api_score;
-
         for a in &elf.anomalies {
             match a.severity {
                 AnomalySeverity::Critical => anomaly_score += 12,
@@ -458,84 +421,66 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<Elf
                 AnomalySeverity::Info => {}
             }
         }
-        anomaly_score = anomaly_score.min(25);
-        score += anomaly_score;
     }
 
-    let score = score.min(100);
-    let level = match score {
-        0..=20 => RiskLevel::Clean,
-        21..=40 => RiskLevel::Low,
-        41..=60 => RiskLevel::Medium,
-        61..=80 => RiskLevel::High,
-        _ => RiskLevel::Critical,
-    };
-
-    let breakdown = RiskBreakdown {
+    RiskBreakdown {
         entropy_score,
-        api_score,
-        anomaly_score,
+        api_score: api_score.min(25),
+        anomaly_score: anomaly_score.min(25),
         string_score,
         packing_score,
-    };
-
-    (score, level, breakdown)
+    }
 }
 
 // ─── Detection checks ───────────────────────────────────────────
 
+fn has_imported_api(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, names: &[&str]) -> bool {
+    if let Some(pe) = pe {
+        if pe.imports.iter().any(|dll| {
+            dll.functions.iter().any(|f| {
+                names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
+            })
+        }) {
+            return true;
+        }
+    }
+    if let Some(elf) = elf {
+        if elf.imported_symbols.iter().any(|f| {
+            names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_all_imported_apis(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, names: &[&str]) -> bool {
+    if let Some(pe) = pe {
+        names.iter().all(|name| {
+            pe.imports.iter().any(|dll| {
+                dll.functions.iter().any(|f| f.name.eq_ignore_ascii_case(name))
+            })
+        })
+    } else if let Some(elf) = elf {
+        names.iter().all(|name| {
+            elf.imported_symbols.iter().any(|f| f.name.eq_ignore_ascii_case(name))
+        })
+    } else {
+        false
+    }
+}
+
 fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
     let mut checks = Vec::with_capacity(35);
 
-    // Helper: check if any string matches a category
     let has_category = |cat: &StringCategory| basic.strings.iter().any(|s| &s.category == cat);
     let has_non_normal = basic
         .strings
         .iter()
         .any(|s| !matches!(s.category, StringCategory::Normal));
 
-    // Helper: check if any imported function name matches (case-insensitive)
-    let has_api = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            if pe.imports.iter().any(|dll| {
-                dll.functions.iter().any(|f| {
-                    let lower = f.name.to_lowercase();
-                    names.iter().any(|n| lower == n.to_lowercase())
-                })
-            }) {
-                return true;
-            }
-        }
-        if let Some(elf) = elf {
-            if elf.imported_symbols.iter().any(|f| {
-                let lower = f.name.to_lowercase();
-                names.iter().any(|n| lower == n.to_lowercase())
-            }) {
-                return true;
-            }
-        }
-        false
-    };
-
-    let has_all_apis = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            names.iter().all(|name| {
-                pe.imports.iter().any(|dll| {
-                    dll.functions
-                        .iter()
-                        .any(|f| f.name.eq_ignore_ascii_case(name))
-                })
-            })
-        } else if let Some(elf) = elf {
-            names.iter().all(|name| {
-                elf.imported_symbols
-                    .iter()
-                    .any(|f| f.name.eq_ignore_ascii_case(name))
-            })
-        } else {
-            false
-        }
-    };
+    let has_api = |names: &[&str]| has_imported_api(pe, elf, names);
+    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, names);
 
     // 1. High entropy (>7.0)
     checks.push(DetectionCheck {
@@ -828,39 +773,7 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
     });
 
     // 26. Selective API Obfuscation
-    let selective_api_obfuscation = pe.as_ref().map(|p| {
-        let has_dyn_loading = p.imports.iter().any(|dll| {
-            dll.functions.iter().any(|f| {
-                let name = f.name.to_lowercase();
-                name.contains("loadlibrary") || name.contains("getprocaddress") || name.contains("ldrloaddll")
-            })
-        });
-
-        if !has_dyn_loading && !peb_walking {
-            return false;
-        }
-
-        let sensitive_apis = [
-            "VirtualAllocEx", "VirtualProtectEx", "WriteProcessMemory", "CreateRemoteThread",
-            "NtCreateThreadEx", "RtlCreateUserThread", "QueueUserAPC", "SetThreadContext",
-            "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess"
-        ];
-
-        let imported_apis: std::collections::HashSet<String> = p.imports.iter()
-            .flat_map(|dll| dll.functions.iter().map(|f| f.name.to_lowercase()))
-            .collect();
-
-        sensitive_apis.iter().any(|&api| {
-            let api_lower = api.to_lowercase();
-            if imported_apis.contains(&api_lower) {
-                return false;
-            }
-            basic.strings.iter().any(|s| {
-                s.value.to_lowercase().contains(&api_lower) || 
-                s.decoded.as_ref().map_or(false, |d| d.to_lowercase().contains(&api_lower))
-            })
-        })
-    }).unwrap_or(false);
+    let selective_api_obfuscation = pe.as_ref().map_or(false, |p| !p.obfuscated_apis.is_empty());
 
     checks.push(DetectionCheck {
         name: "Selective API Obfuscation".into(),
@@ -999,46 +912,8 @@ fn detect_malware_pattern(
     pe: &Option<PeAnalysis>,
     elf: &Option<ElfAnalysis>,
 ) -> Option<MalwarePattern> {
-    // Helper closures
-    let has_api = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            if pe.imports.iter().any(|dll| {
-                dll.functions.iter().any(|f| {
-                    names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
-                })
-            }) {
-                return true;
-            }
-        }
-        if let Some(elf) = elf {
-            if elf.imported_symbols.iter().any(|f| {
-                names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
-            }) {
-                return true;
-            }
-        }
-        false
-    };
-
-    let has_all_apis = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            names.iter().all(|name| {
-                pe.imports.iter().any(|dll| {
-                    dll.functions
-                        .iter()
-                        .any(|f| f.name.eq_ignore_ascii_case(name))
-                })
-            })
-        } else if let Some(elf) = elf {
-            names.iter().all(|name| {
-                elf.imported_symbols
-                    .iter()
-                    .any(|f| f.name.eq_ignore_ascii_case(name))
-            })
-        } else {
-            false
-        }
-    };
+    let has_api = |names: &[&str]| has_imported_api(pe, elf, names);
+    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, names);
 
     let has_category = |cat: &StringCategory| basic.strings.iter().any(|s| &s.category == cat);
 
@@ -1568,8 +1443,9 @@ mod tests {
 
         // Indirect Syscall test
         let indirect_code = [
+            0x4C, 0x8B, 0xD1,             // mov r10, rcx
             0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
-            0x41, 0xFF, 0xE3              // jmp r11
+            0x41, 0xFF, 0xE3,             // jmp r11
         ];
         let (_, _, direct, indirect, locations) = scan_peb_and_hashing(64, &indirect_code, 0x1000);
         assert!(!direct);

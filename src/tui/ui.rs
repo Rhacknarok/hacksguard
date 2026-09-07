@@ -451,6 +451,14 @@ fn build_hashes_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(kv_line("MD5   ", &b.md5));
     lines.push(kv_line("SHA1  ", &b.sha1));
     lines.push(kv_line("SHA256", &b.sha256));
+    if let Some(pe) = app.current_pe() {
+        if let Some(ref imphash) = pe.imphash {
+            lines.push(kv_line("Imphash", imphash));
+        }
+        if let Some(ref rich) = pe.rich_header {
+            lines.push(kv_line("RichPE ", &rich.rich_hash));
+        }
+    }
     lines.push(Line::from(""));
 }
 
@@ -1103,6 +1111,9 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
         kv_line("Subsystem", &pe.subsystem),
         kv_line("Linker", &pe.linker_version),
     ];
+    if let Some(ref imphash) = pe.imphash {
+        center_lines.push(kv_line("Imphash", imphash));
+    }
     if let Some(ref pdb) = pe.pdb_path {
         center_lines.push(kv_line("PDB Path", pdb));
     }
@@ -1164,7 +1175,7 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    // Right Column: Data Directories
+    // Right Column: Data Directories & Rich Header
     let mut right_lines = vec![
         section_header("Data Directories"),
     ];
@@ -1181,6 +1192,22 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(color),
             ),
         ]));
+    }
+
+    if let Some(rich) = &pe.rich_header {
+        right_lines.push(Line::from(""));
+        right_lines.push(section_header(&format!("Rich Header (XOR: {:#010x})", rich.xor_key)));
+        right_lines.push(kv_line("Rich Hash", &rich.rich_hash));
+        for rec in &rich.records {
+            let tool = rec.tool_name.as_deref().unwrap_or("Unknown");
+            right_lines.push(Line::from(vec![
+                Span::styled(format!("  {:<12} ", tool), theme::label()),
+                Span::styled(
+                    format!("ID: {:<3} Build: {:<5} Count: {}", rec.prod_id, rec.build, rec.count),
+                    Style::default().fg(theme::TEXT),
+                ),
+            ]));
+        }
     }
 
     frame.render_widget(
@@ -1443,6 +1470,10 @@ fn draw_strings(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
+                if s.is_wide { "W " } else { "A " },
+                Style::default().fg(if s.is_wide { theme::INFO } else { theme::TEXT_DIM }),
+            ),
+            Span::styled(
                 format!("{:#08x} ", s.offset),
                 Style::default().fg(theme::TEXT_DIM),
             ),
@@ -1644,26 +1675,29 @@ fn draw_guide(frame: &mut Frame, area: Rect, app: &App) {
 
 // ─── Disasm tab ──────────────────────────────────────────────────
 
-fn draw_disasm(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(pe) = app.current_pe() else {
-        frame.render_widget(Paragraph::new(" No PE metadata for disassembly"), area);
-        return;
-    };
-
+fn render_disasm(
+    frame: &mut Frame,
+    area: Rect,
+    scroll_offset: u16,
+    title: &str,
+    syscall_locations: &[crate::models::SyscallLocation],
+    is_64bit: bool,
+    ep_bytes: &[u8],
+    entry_point: u64,
+) {
     let mut lines = Vec::new();
 
-    if !pe.syscall_locations.is_empty() {
+    if !syscall_locations.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(" Detected System Call Instructions ", Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
         ]));
         lines.push(Line::from(""));
-        for loc in &pe.syscall_locations {
+        for loc in syscall_locations {
             let type_str = if loc.is_indirect { "Indirect" } else { "Direct" };
-            let type_color = theme::CRITICAL;
             lines.push(Line::from(vec![
                 Span::styled("  Address: ", Style::default().fg(theme::TEXT_DIM)),
                 Span::styled(format!("{:#010x}", loc.address), Style::default().fg(theme::INFO)),
-                Span::styled(format!("  [{}]  ", type_str), Style::default().fg(type_color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  [{}]  ", type_str), Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
                 Span::styled(&loc.instruction_str, Style::default().fg(theme::TEXT)),
             ]));
         }
@@ -1673,12 +1707,12 @@ fn draw_disasm(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     lines.push(Line::from(vec![
-        Span::styled(format!(" Disassembly at Entry Point ({:#010x}) ", pe.entry_point), Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" Disassembly at Entry Point ({:#010x}) ", entry_point), Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(""));
 
-    let bitness = if pe.is_64bit { 64 } else { 32 };
-    let mut decoder = Decoder::with_ip(bitness, &pe.ep_bytes, pe.entry_point as u64, DecoderOptions::NONE);
+    let bitness = if is_64bit { 64 } else { 32 };
+    let mut decoder = Decoder::with_ip(bitness, ep_bytes, entry_point, DecoderOptions::NONE);
     let mut formatter = NasmFormatter::new();
     formatter.options_mut().set_digit_separator("_");
     formatter.options_mut().set_first_operand_char_index(10);
@@ -1701,16 +1735,33 @@ fn draw_disasm(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(line);
     }
 
-    if lines.len() == 2 {
+    if lines.len() <= 2 {
         lines.push(Line::from(Span::styled("  No valid instructions found.", Style::default().fg(theme::TEXT_DIM))));
     }
 
-    let block = panel_block("Disassembly");
+    let block = panel_block(title);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .scroll((app.scroll_offset, 0)),
+            .scroll((scroll_offset, 0)),
         area,
+    );
+}
+
+fn draw_disasm(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(pe) = app.current_pe() else {
+        frame.render_widget(Paragraph::new(" No PE metadata for disassembly"), area);
+        return;
+    };
+    render_disasm(
+        frame,
+        area,
+        app.scroll_offset,
+        "Disassembly",
+        &pe.syscall_locations,
+        pe.is_64bit,
+        &pe.ep_bytes,
+        pe.entry_point,
     );
 }
 
@@ -2275,65 +2326,14 @@ fn draw_elf_disasm(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(" No ELF metadata for disassembly"), area);
         return;
     };
-
-    let mut lines = Vec::new();
-
-    if !elf.syscall_locations.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(" Detected Direct System Call Instructions ", Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
-        ]));
-        lines.push(Line::from(""));
-        for loc in &elf.syscall_locations {
-            lines.push(Line::from(vec![
-                Span::styled("  Address: ", Style::default().fg(theme::TEXT_DIM)),
-                Span::styled(format!("{:#010x}", loc.address), Style::default().fg(theme::INFO)),
-                Span::styled("  [Direct]  ", Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
-                Span::styled(&loc.instruction_str, Style::default().fg(theme::TEXT)),
-            ]));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(" ────────────────────────────────────────────────────────────────────────", Style::default().fg(theme::TEXT_DIM))));
-        lines.push(Line::from(""));
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled(format!(" Disassembly at Entry Point ({:#010x}) ", elf.entry_point), Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(""));
-
-    let bitness = if elf.is_64bit { 64 } else { 32 };
-    let mut decoder = Decoder::with_ip(bitness, &elf.ep_bytes, elf.entry_point, DecoderOptions::NONE);
-    let mut formatter = NasmFormatter::new();
-    formatter.options_mut().set_digit_separator("_");
-    formatter.options_mut().set_first_operand_char_index(10);
-    
-    let mut instruction = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instruction);
-        let mut output = String::new();
-        formatter.format(&instruction, &mut output);
-
-        let addr = format!("{:016X}", instruction.ip());
-        let mnemonic_str = output.split_whitespace().next().unwrap_or("").to_string();
-        let rest = output.strip_prefix(&mnemonic_str).unwrap_or("").to_string();
-
-        let line = Line::from(vec![
-            Span::styled(format!(" {} ", addr), Style::default().fg(theme::TEXT_DIM)),
-            Span::styled(format!("{:<8}", mnemonic_str), Style::default().fg(theme::INFO).add_modifier(Modifier::BOLD)),
-            Span::styled(rest, Style::default().fg(theme::TEXT)),
-        ]);
-        lines.push(line);
-    }
-
-    if lines.len() <= 2 {
-        lines.push(Line::from(Span::styled("  No valid instructions found at entry point.", Style::default().fg(theme::TEXT_DIM))));
-    }
-
-    let block = panel_block("ELF Disassembly");
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .scroll((app.scroll_offset, 0)),
+    render_disasm(
+        frame,
         area,
+        app.scroll_offset,
+        "ELF Disassembly",
+        &elf.syscall_locations,
+        elf.is_64bit,
+        &elf.ep_bytes,
+        elf.entry_point,
     );
 }

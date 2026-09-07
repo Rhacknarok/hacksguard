@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **UTF-16LE Wide String Extraction**:
+  - Implemented dual-alignment UTF-16LE string scanner detecting wide string sequences alongside standard ASCII.
+  - Added automatic overlap detection and trimming between adjacent ASCII and wide strings.
+  - Added `W` (wide) and `A` (ascii) visual indicators in the TUI Strings view.
+- **Mandiant Imphash**:
+  - Implemented standard Mandiant/VirusTotal Imphash MD5 hash computation over import tables (case folding, extension stripping, ordinal normalization).
+  - Rendered Imphash in both Overview (Hashes) and PE Headers tabs.
+- **Rich PE Header & RichPE Hash**:
+  - Implemented bit-exact Rich Header parser with XOR key detection, `DanS` magic verification, and padding validation.
+  - Decoded CompID build records with MSVC toolchain identifier mapping (Linker, C/C++ Compiler, MASM, Cvtomf, Resource).
+  - Computed standard RichPE header MD5 hash, rendered in Overview and PE Headers tabs.
 - **Linux ELF Static Analysis Support**:
   - Implemented full ELF parsing module (`src/analysis/elf.rs`) supporting x86, x86-64, ARM, AArch64, MIPS, RISC-V, PowerPC, and s390x binaries.
   - Added binary hardening & mitigation inspection: Non-Executable stack (`NX` via `PT_GNU_STACK`), Position-Independent Executable (`PIE` via `ET_DYN`), `RELRO` (`None`, `Partial`, `Full`), Stack Canary (`__stack_chk_fail`), Fortified Source, and `RPATH`/`RUNPATH` library hijacking detection.
@@ -16,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added direct system call opcode scan (`syscall`, `sysenter`, `int 0x80`) via `iced-x86`.
   - Added Linux malware heuristic pattern detection (`Rootkit.Linux`, `Dropper.Fileless.Linux`, `Botnet.IoT.Linux`).
   - Added dynamic TUI tabs for ELF binaries (`Headers`, `Segments`, `Sections`, `Imports`, `Disasm`) and integrated metadata into the Overview dashboard.
+
+### Changed
+- **Architecture & Complexity Refactor (Ponytail Audit)**:
+  - Deduplicated analysis pipeline: unified risk breakdown calculation and removed redundant API obfuscation scanning loops.
+  - Unified PE and ELF disassembly rendering logic into a single shared helper (`render_disasm`).
+  - Simplified TUI initialization and restoration to native standard `ratatui::init` / `ratatui::restore`.
 
 ### Fixed
 - **Cross-Platform YARA Cache & Path Resolution**: Fixed `.yara_cache` loading failures on non-Windows platforms:

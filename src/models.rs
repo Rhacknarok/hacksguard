@@ -19,6 +19,29 @@ pub struct AnalysisResult {
     pub entropy_graph: Vec<u64>,
 }
 
+impl AnalysisResult {
+    pub fn attach_embedded_pe(&mut self, pe: PeAnalysis) {
+        self.detection_checks.push(DetectionCheck {
+            name: "Embedded PE executable found".into(),
+            triggered: true,
+            severity: DetectionSeverity::Critical,
+        });
+
+        if let Some(ref mut parent_pe) = self.pe {
+            parent_pe.embedded_pe = Some(Box::new(pe));
+        } else {
+            self.pe = Some(pe);
+        }
+
+        let (score, level) = crate::analysis::compute_risk_from_checks(
+            &self.detection_checks,
+            &self.yara_matches,
+        );
+        self.risk_score = score;
+        self.risk_level = level;
+    }
+}
+
 // ─── File info ───────────────────────────────────────────────────
 
 #[derive(serde::Serialize)]
@@ -69,6 +92,7 @@ pub struct ExtractedString {
     pub offset: usize,
     pub category: StringCategory,
     pub decoded: Option<String>,
+    pub is_wide: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +158,23 @@ pub struct PeAnalysis {
     pub direct_syscalls: bool,
     pub indirect_syscalls: bool,
     pub syscall_locations: Vec<SyscallLocation>,
+    pub imphash: Option<String>,
+    pub rich_header: Option<RichHeaderInfo>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct RichRecord {
+    pub prod_id: u16,
+    pub build: u16,
+    pub count: u32,
+    pub tool_name: Option<String>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct RichHeaderInfo {
+    pub xor_key: u32,
+    pub rich_hash: String,
+    pub records: Vec<RichRecord>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -269,16 +310,6 @@ pub enum ElfRelro {
     None,
     Partial,
     Full,
-}
-
-impl fmt::Display for ElfRelro {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => write!(f, "No RELRO"),
-            Self::Partial => write!(f, "Partial RELRO"),
-            Self::Full => write!(f, "Full RELRO"),
-        }
-    }
 }
 
 // ─── Risk scoring ────────────────────────────────────────────────
