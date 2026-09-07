@@ -2,6 +2,7 @@ pub mod basic;
 pub mod pe;
 pub mod elf;
 pub mod macho;
+pub mod authenticode;
 
 use crate::models::*;
 use color_eyre::Result;
@@ -888,6 +889,24 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
     checks.push(DetectionCheck {
         name: "Stealth C2 Agent Profile (Evasive Loading + Sparse IAT)".into(),
         triggered: stealth_c2,
+        severity: DetectionSeverity::Critical,
+    });
+
+    let self_signed_cert = pe.as_ref().map(|p| {
+        p.certificate.as_ref().map_or(false, |c| c.is_self_signed)
+    }).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "Self-signed Authenticode Certificate".into(),
+        triggered: self_signed_cert,
+        severity: DetectionSeverity::Critical,
+    });
+
+    let xor_payload_detected = pe.as_ref().map(|p| !p.xor_payloads.is_empty()).unwrap_or(false);
+
+    checks.push(DetectionCheck {
+        name: "1-byte XOR Encrypted Payload".into(),
+        triggered: xor_payload_detected,
         severity: DetectionSeverity::Critical,
     });
 

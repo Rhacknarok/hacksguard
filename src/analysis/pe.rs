@@ -273,16 +273,30 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
     let compilation_age = format_compilation_age(timestamp);
     let timestamp_suspicious = is_timestamp_suspicious(timestamp);
 
-    let has_authenticode = if let Some(opt) = pe.header.optional_header {
+    let (has_authenticode, certificate) = if let Some(opt) = pe.header.optional_header {
         let dirs = opt.data_directories.data_directories;
         if let Some(Some((_, sec_dir))) = dirs.get(4) {
-            sec_dir.virtual_address != 0 && sec_dir.size != 0
+            if sec_dir.virtual_address != 0 && sec_dir.size != 0 {
+                let cert = crate::analysis::authenticode::parse_authenticode(data, sec_dir.virtual_address as usize, sec_dir.size as usize);
+                (true, cert)
+            } else {
+                (false, None)
+            }
         } else {
-            false
+            (false, None)
         }
     } else {
-        false
+        (false, None)
     };
+
+    if let Some(ref cert) = certificate {
+        if cert.is_self_signed {
+            anomalies.push(Anomaly {
+                severity: AnomalySeverity::Critical,
+                description: format!("Self-signed Authenticode certificate ({})", cert.subject),
+            });
+        }
+    }
 
     let mut ep_bytes = Vec::new();
     // Try to get 100 bytes at the entry point for disassembly
@@ -349,6 +363,45 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
     let imphash = compute_imphash(&pe.imports);
     let rich_header = parse_rich_header(data);
 
+    // ── 1-byte XOR brute-force scanner on overlay and high-entropy sections ──
+    let mut xor_payloads = Vec::new();
+    if let (Some(off), Some(sz)) = (overlay_offset, overlay_size) {
+        let mut scan_off = off;
+        let mut scan_sz = sz;
+        if let Some(opt) = pe.header.optional_header {
+            if let Some(Some((_, sec_dir))) = opt.data_directories.data_directories.get(4) {
+                let cert_off = sec_dir.virtual_address as usize;
+                let cert_sz = sec_dir.size as usize;
+                if cert_off == off && cert_sz <= sz {
+                    scan_off = off + cert_sz;
+                    scan_sz = sz - cert_sz;
+                }
+            }
+        }
+        if scan_sz >= 64 {
+            let scan_end = (scan_off + scan_sz).min(scan_off + 1024 * 1024).min(data.len());
+            if scan_off < scan_end {
+                xor_payloads.extend(scan_xor_payloads(&data[scan_off..scan_end], scan_off, "Overlay"));
+            }
+        }
+    }
+    for sec in &sections {
+        if sec.entropy >= 6.0 && sec.raw_size >= 64 {
+            let start = sec.raw_offset as usize;
+            let end = (start + sec.raw_size as usize).min(start + 512 * 1024).min(data.len());
+            if start < end {
+                xor_payloads.extend(scan_xor_payloads(&data[start..end], start, &format!("Section {}", sec.name)));
+            }
+        }
+    }
+
+    for p in &xor_payloads {
+        anomalies.push(Anomaly {
+            severity: AnomalySeverity::Critical,
+            description: format!("1-byte XOR encrypted payload in {} (key {:#04x}: {})", p.target_location, p.key, p.description),
+        });
+    }
+
     Ok(PeAnalysis {
         machine,
         timestamp,
@@ -385,6 +438,8 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         syscall_locations: Vec::new(),
         imphash,
         rich_header,
+        certificate,
+        xor_payloads,
     })
 }
 
@@ -767,6 +822,127 @@ pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
     None
 }
 
+/// Brute-force single-pass 1-byte XOR scanner for hidden PEs, DOS stubs, and URLs.
+pub fn scan_xor_payloads(data: &[u8], base_offset: usize, location: &str) -> Vec<XorPayloadMatch> {
+    let mut results = Vec::new();
+    if data.len() < 8 {
+        return results;
+    }
+
+    const DOS_STUB: &[u8] = b"This program cannot be run in DOS mode";
+    const HTTP: &[u8] = b"http://";
+    const HTTPS: &[u8] = b"https://";
+
+    let mut i = 0;
+    while i < data.len() {
+        // 1. Check for XOR-encoded PE executable (MZ header + e_lfanew + PE signature)
+        if i + 64 <= data.len() {
+            let key = data[i] ^ b'M';
+            if key != 0 && (data[i + 1] ^ key) == b'Z' {
+                let e_lfanew = u32::from_le_bytes([
+                    data[i + 0x3c] ^ key,
+                    data[i + 0x3d] ^ key,
+                    data[i + 0x3e] ^ key,
+                    data[i + 0x3f] ^ key,
+                ]) as usize;
+
+                if (0x40..=0x1000).contains(&e_lfanew) && i + e_lfanew + 4 <= data.len() {
+                    if (data[i + e_lfanew] ^ key) == b'P'
+                        && (data[i + e_lfanew + 1] ^ key) == b'E'
+                        && (data[i + e_lfanew + 2] ^ key) == 0
+                        && (data[i + e_lfanew + 3] ^ key) == 0
+                    {
+                        results.push(XorPayloadMatch {
+                            key,
+                            offset: base_offset + i,
+                            target_location: location.to_string(),
+                            description: "XOR-encoded PE executable (MZ...PE)".to_string(),
+                            sample_preview: format!("MZ header at offset {:#x}, e_lfanew={:#x}", base_offset + i, e_lfanew),
+                        });
+                        i += 64;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 2. Check for XOR-encoded DOS stub
+        if i + DOS_STUB.len() <= data.len() {
+            let key = data[i] ^ b'T';
+            if key != 0 {
+                let matches_stub = data[i..i + DOS_STUB.len()]
+                    .iter()
+                    .zip(DOS_STUB.iter())
+                    .all(|(&b, &expected)| (b ^ key) == expected);
+
+                if matches_stub {
+                    let already_found_pe = results.iter().any(|r| {
+                        r.key == key && r.description.contains("PE executable") && (base_offset + i).saturating_sub(r.offset) < 0x200
+                    });
+                    if !already_found_pe {
+                        results.push(XorPayloadMatch {
+                            key,
+                            offset: base_offset + i,
+                            target_location: location.to_string(),
+                            description: "XOR-encoded DOS stub".to_string(),
+                            sample_preview: "This program cannot be run in DOS mode".to_string(),
+                        });
+                    }
+                    i += DOS_STUB.len();
+                    continue;
+                }
+            }
+        }
+
+        // 3. Check for XOR-encoded URLs (http:// or https://)
+        if i + 7 <= data.len() {
+            let key = data[i] ^ b'h';
+            if key != 0 {
+                let is_https = i + 8 <= data.len()
+                    && data[i..i + 8]
+                        .iter()
+                        .zip(HTTPS.iter())
+                        .all(|(&b, &expected)| (b ^ key) == expected);
+
+                let is_http = !is_https
+                    && data[i..i + 7]
+                        .iter()
+                        .zip(HTTP.iter())
+                        .all(|(&b, &expected)| (b ^ key) == expected);
+
+                if is_https || is_http {
+                    let mut url_bytes = Vec::new();
+                    let max_scan = 128.min(data.len() - i);
+                    for &b in &data[i..i + max_scan] {
+                        let dec = b ^ key;
+                        if (0x21..=0x7e).contains(&dec) && dec != b'"' && dec != b'\'' && dec != b'<' && dec != b'>' && dec != b'`' {
+                            url_bytes.push(dec);
+                        } else {
+                            break;
+                        }
+                    }
+                    if url_bytes.len() >= 10 {
+                        let url_str = String::from_utf8_lossy(&url_bytes).to_string();
+                        results.push(XorPayloadMatch {
+                            key,
+                            offset: base_offset + i,
+                            target_location: location.to_string(),
+                            description: "XOR-encoded URL".to_string(),
+                            sample_preview: url_str,
+                        });
+                        i += url_bytes.len();
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    results
+}
+
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
     if offset + 2 <= data.len() {
         Some(u16::from_le_bytes([data[offset], data[offset + 1]]))
@@ -905,5 +1081,59 @@ mod tests {
         assert_eq!(res.records[0].count, 5);
         assert_eq!(res.records[0].tool_name.as_deref(), Some("C Compiler"));
         assert_eq!(res.rich_hash.len(), 32);
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_pe() {
+        let key = 0x5a;
+        let mut raw_pe = vec![0u8; 256];
+        raw_pe[0] = b'M';
+        raw_pe[1] = b'Z';
+        raw_pe[0x3c] = 0x80; // e_lfanew = 128
+        raw_pe[0x80] = b'P';
+        raw_pe[0x81] = b'E';
+        raw_pe[0x82] = 0;
+        raw_pe[0x83] = 0;
+
+        let xored: Vec<u8> = raw_pe.iter().map(|b| b ^ key).collect();
+        let matches = scan_xor_payloads(&xored, 0x1000, "Overlay");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].key, 0x5a);
+        assert_eq!(matches[0].offset, 0x1000);
+        assert!(matches[0].description.contains("PE executable"));
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_url() {
+        let key = 0x42;
+        let mut raw = vec![0x00; 64];
+        raw.extend_from_slice(b"https://c2-malware-domain.xyz/payload.bin\0");
+        raw.extend_from_slice(&[0x00; 32]);
+        let buffer: Vec<u8> = raw.iter().map(|b| b ^ key).collect();
+
+        let matches = scan_xor_payloads(&buffer, 0x500, "Section .data");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].key, 0x42);
+        assert_eq!(matches[0].sample_preview, "https://c2-malware-domain.xyz/payload.bin");
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_dos_stub() {
+        let key = 0x77;
+        let stub = b"This program cannot be run in DOS mode";
+        let xored_stub: Vec<u8> = stub.iter().map(|b| b ^ key).collect();
+
+        let matches = scan_xor_payloads(&xored_stub, 0x200, "Overlay");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].key, 0x77);
+        assert_eq!(matches[0].description, "XOR-encoded DOS stub");
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_plaintext_ignored() {
+        let url = b"https://legitimate.org/test";
+        let matches = scan_xor_payloads(url, 0, "Overlay");
+        // Key 0 is plaintext, must be ignored by XOR brute-forcer
+        assert!(matches.is_empty());
     }
 }

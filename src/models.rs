@@ -161,6 +161,28 @@ pub struct PeAnalysis {
     pub syscall_locations: Vec<SyscallLocation>,
     pub imphash: Option<String>,
     pub rich_header: Option<RichHeaderInfo>,
+    pub certificate: Option<CertificateInfo>,
+    pub xor_payloads: Vec<XorPayloadMatch>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct CertificateInfo {
+    pub subject: String,
+    pub issuer: String,
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+    pub digest_algorithm: Option<String>,
+    pub serial_number: Option<String>,
+    pub is_self_signed: bool,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct XorPayloadMatch {
+    pub key: u8,
+    pub offset: usize,
+    pub target_location: String,
+    pub description: String,
+    pub sample_preview: String,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

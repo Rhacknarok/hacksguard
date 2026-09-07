@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Authenticode DER Certificate Decoding (X.509 & PKCS#7)**:
+  - Implemented zero-dependency ASN.1 DER and PKCS#7 `SignedData` parser (`src/analysis/authenticode.rs`) decoding leaf X.509 certificates from the PE Security Directory (`IMAGE_DIRECTORY_ENTRY_SECURITY`).
+  - Extracted certificate Subject, Issuer, Validity window (parsed from UTCTime / GeneralizedTime), Digest Algorithm (SHA-256, SHA-1, SHA-384, SHA-512, ECDSA), Serial Number, and self-signed verification (`Subject == Issuer`).
+  - Added Critical anomaly and detection check for self-signed Authenticode certificates.
+  - Rendered certificate details and warnings in both the Overview metadata panel and PE Headers tab.
+- **1-Byte XOR Payload Brute-Force Scanner**:
+  - Implemented single-pass O(N) 1-byte XOR scanner (`scan_xor_payloads`) targeting overlay regions (with certificate table offset disambiguation) and high-entropy sections ($\ge 6.0$).
+  - Detects obfuscated PE binaries (`MZ` header + `e_lfanew` + `PE\0\0` signature), DOS stub strings (`This program cannot be run in DOS mode`), and embedded URLs (`http://`, `https://`).
+  - Added Critical anomaly and detection check for XOR-encrypted payloads.
+  - Rendered detected XOR keys, target locations, descriptions, and decrypted sample previews in both the Overview dashboard and PE Headers tab.
 - **macOS Mach-O & Universal Fat Binary Static Analysis**:
   - Implemented full Mach-O analysis engine (`src/analysis/macho.rs`) parsing single architecture and Universal Fat Mach-O containers (prioritizing ARM64, fallback to x86-64).
   - Added binary mitigation checks: Position-Independent Executable (`MH_PIE`), Non-Executable Stack (`MH_ALLOW_STACK_EXECUTION`), Heap execution restrictions (`MH_NO_HEAP_EXECUTION`), code signature verification (`LC_CODE_SIGNATURE`), and `RPATH` library search path hijacking risks.

@@ -333,7 +333,21 @@ fn build_file_info_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     if let Some(pe) = app.current_pe() {
         lines.push(Line::from(""));
         lines.push(section_header("PE Metadata"));
-        lines.push(kv_line("Authenticode", if pe.has_authenticode { "✅" } else { "❌" }));
+        if let Some(ref cert) = pe.certificate {
+            let status = if cert.is_self_signed {
+                format!("✅ Signed (Self-Signed ⚠️ - {})", cert.subject)
+            } else {
+                format!("✅ Signed ({})", cert.subject)
+            };
+            lines.push(kv_line("Certificate", &status));
+        } else if pe.has_authenticode {
+            lines.push(kv_line("Authenticode", "✅ Present"));
+        } else {
+            lines.push(kv_line("Authenticode", "❌ Not signed"));
+        }
+        if !pe.xor_payloads.is_empty() {
+            lines.push(kv_line("XOR Payloads", &format!("⚠️ {} detected", pe.xor_payloads.len())));
+        }
         lines.push(kv_line(
             "Entry Point",
             &format!("{:#010x}", pe.entry_point),
@@ -1246,6 +1260,41 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
                     format!("ID: {:<3} Build: {:<5} Count: {}", rec.prod_id, rec.build, rec.count),
                     Style::default().fg(theme::TEXT),
                 ),
+            ]));
+        }
+    }
+
+    if let Some(cert) = &pe.certificate {
+        right_lines.push(Line::from(""));
+        let cert_title = if cert.is_self_signed {
+            "Certificate (Self-Signed ⚠️)"
+        } else {
+            "Certificate (Authenticode)"
+        };
+        right_lines.push(section_header(cert_title));
+        right_lines.push(kv_line("Subject", &cert.subject));
+        right_lines.push(kv_line("Issuer", &cert.issuer));
+        if let Some(ref alg) = cert.digest_algorithm {
+            right_lines.push(kv_line("Digest Alg", alg));
+        }
+        if let (Some(ref nb), Some(ref na)) = (&cert.not_before, &cert.not_after) {
+            right_lines.push(kv_line("Validity", &format!("{} -> {}", nb, na)));
+        }
+        if let Some(ref serial) = cert.serial_number {
+            right_lines.push(kv_line("Serial", serial));
+        }
+    }
+
+    if !pe.xor_payloads.is_empty() {
+        right_lines.push(Line::from(""));
+        right_lines.push(section_header(&format!("XOR Payloads Detected ({})", pe.xor_payloads.len())));
+        for p in pe.xor_payloads.iter().take(10) {
+            right_lines.push(Line::from(vec![
+                Span::styled(format!("  [key {:#04x}] ", p.key), Style::default().fg(theme::CRITICAL)),
+                Span::styled(format!("{}: {}", p.target_location, p.description), Style::default().fg(theme::TEXT)),
+            ]));
+            right_lines.push(Line::from(vec![
+                Span::styled(format!("    └─ {} ", p.sample_preview), Style::default().fg(theme::TEXT_DIM)),
             ]));
         }
     }
