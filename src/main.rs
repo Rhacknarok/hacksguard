@@ -4,14 +4,14 @@ mod analysis;
 mod app;
 mod models;
 mod theme;
-mod tui;
+mod ui;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::Parser;
-use color_eyre::Result;
+use crate::models::Result;
 use std::path::PathBuf;
 
 /// HACKSGUARD — TUI malware analysis tool
@@ -26,7 +26,6 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    color_eyre::install()?;
     let cli = Cli::parse();
 
     if !cli.file.exists() {
@@ -39,30 +38,13 @@ fn main() -> Result<()> {
         let data = std::fs::read(&cli.file).unwrap_or_default();
         let parent_is_pe = result.pe.is_some();
         if let Some(pe) = analysis::find_embedded_pe(&data, parent_is_pe) {
-            result.detection_checks.push(crate::models::DetectionCheck {
-                name: "Embedded PE executable found".into(),
-                triggered: true,
-                severity: crate::models::DetectionSeverity::Critical,
-            });
-
-            if result.pe.is_some() {
-                result.pe.as_mut().unwrap().embedded_pe = Some(Box::new(pe));
-            } else {
-                result.pe = Some(pe);
-            }
-
-            let (score, level) = crate::analysis::compute_risk_from_checks(
-                &result.detection_checks,
-                &result.yara_matches,
-            );
-            result.risk_score = score;
-            result.risk_level = level;
+            result.attach_embedded_pe(pe);
         }
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
 
-    let mut terminal = tui::init();
+    let mut terminal = ratatui::init();
 
     let (tx, rx) = std::sync::mpsc::channel();
     let (prog_tx, prog_rx) = std::sync::mpsc::channel();
@@ -76,7 +58,7 @@ fn main() -> Result<()> {
     let mut tasks_done = 0;
 
     let result = loop {
-        while let Ok(_) = prog_rx.try_recv() {
+        while prog_rx.try_recv().is_ok() {
             tasks_done += 1;
         }
 
@@ -121,7 +103,7 @@ fn main() -> Result<()> {
         if crossterm::event::poll(std::time::Duration::from_millis(0))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.code == crossterm::event::KeyCode::Char('q') || key.code == crossterm::event::KeyCode::Esc {
-                    tui::restore();
+                    ratatui::restore();
                     std::process::exit(0);
                 }
             }
@@ -154,6 +136,6 @@ fn main() -> Result<()> {
     app.embedded_pe_loading = true;
 
     let res = app.run(&mut terminal);
-    tui::restore();
+    ratatui::restore();
     res
 }

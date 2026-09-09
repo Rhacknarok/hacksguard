@@ -5,6 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] - 2026-09-09
+
+### Added
+- **Authenticode DER Certificate Decoding (X.509 & PKCS#7)**:
+  - Implemented zero-dependency ASN.1 DER and PKCS#7 `SignedData` parser (`src/analysis/authenticode.rs`) decoding leaf X.509 certificates from the PE Security Directory (`IMAGE_DIRECTORY_ENTRY_SECURITY`).
+  - Extracted certificate Subject, Issuer, Validity window (parsed from UTCTime / GeneralizedTime), Digest Algorithm (SHA-256, SHA-1, SHA-384, SHA-512, ECDSA), Serial Number, and self-signed verification (`Subject == Issuer`).
+  - Added Critical anomaly and detection check for self-signed Authenticode certificates.
+  - Rendered certificate details and warnings in both the Overview metadata panel and PE Headers tab.
+- **1-Byte XOR Payload Brute-Force Scanner**:
+  - Implemented single-pass O(N) 1-byte XOR scanner (`scan_xor_payloads`) targeting overlay regions (with certificate table offset disambiguation) and high-entropy sections ($\ge 6.0$).
+  - Detects obfuscated PE binaries (`MZ` header + `e_lfanew` + `PE\0\0` signature), DOS stub strings (`This program cannot be run in DOS mode`), and embedded URLs (`http://`, `https://`).
+  - Added Critical anomaly and detection check for XOR-encrypted payloads.
+  - Rendered detected XOR keys, target locations, descriptions, and decrypted sample previews in both the Overview dashboard and PE Headers tab.
+- **macOS Mach-O & Universal Fat Binary Static Analysis**:
+  - Implemented full Mach-O analysis engine (`src/analysis/macho.rs`) parsing single architecture and Universal Fat Mach-O containers (prioritizing ARM64, fallback to x86-64).
+  - Added binary mitigation checks: Position-Independent Executable (`MH_PIE`), Non-Executable Stack (`MH_ALLOW_STACK_EXECUTION`), Heap execution restrictions (`MH_NO_HEAP_EXECUTION`), code signature verification (`LC_CODE_SIGNATURE`), and `RPATH` library search path hijacking risks.
+  - Added segment and section inspection with Shannon entropy calculation, flagging W+X permissions and high-entropy packed sections.
+  - Added Darwin symbol and API classification (`task_for_pid`, `mach_vm_write`, `NSCreateObjectFileImageFromMemory`, `CGEventTapCreate`, `SecKeychainItemCopyAttributesAndData`, `posix_spawn`).
+  - Added macOS malware heuristic pattern detection (`Spyware.macOS`, `Stealer.macOS`, `Injector.macOS`).
+  - Added dynamic TUI tabs for Mach-O binaries (`Headers`, `Segments`, `Sections`, `Imports`, `Disasm`).
+- **Cross-Platform ARM64 Direct Syscall Scanner (`svc`)**:
+  - Implemented zero-dependency bitmask scanner for ARM64 `svc #imm` instructions (`(word & 0xFFE0_001F) == 0xD400_0001`), supporting `svc #0` (Linux AArch64) and `svc #0x80` / `svc #0` (macOS Darwin ARM64).
+  - Integrated ARM64 syscall detection across both ELF (`EM_AARCH64`) and Mach-O (`CPU_TYPE_ARM64`).
+  - Updated TUI disassembly view (`render_disasm`) to display 4-byte instruction words with highlighted syscall stubs on ARM64 architectures without invoking x86 decoders.
+- **Interactive Search (`/`)**:
+  - Implemented live substring filtering across Strings, Imports, Sections, and ELF Symbols tabs.
+  - Added dedicated status bar input prompt (`/query█`), with `Enter` to apply filter and `Esc` to cancel/clear.
+- **Strings Category Filters**:
+  - Added single-key category toggles in the Strings view: `u` (URLs), `i` (IPs), `r` (Registry keys), `c` (Commands), `s` (Suspicious), `p` (File paths), and `a` (All).
+  - Added interactive category filter bar in the Strings tab header displaying active filters and matching counts.
+- **OSC 52 Clipboard Copy (`y`)**:
+  - Implemented zero-dependency clipboard copying via standard ANSI OSC 52 escape sequences (`\x1b]52;c;...`).
+  - Context-aware copying: copies active hashes (SHA-256, Imphash, RichPE) or filtered strings, displaying temporary confirmation toasts.
+- **UTF-16LE Wide String Extraction**:
+  - Implemented dual-alignment UTF-16LE string scanner detecting wide string sequences alongside standard ASCII.
+  - Added automatic overlap detection and trimming between adjacent ASCII and wide strings.
+  - Added `W` (wide) and `A` (ascii) visual indicators in the TUI Strings view.
+- **Mandiant Imphash**:
+  - Implemented standard Mandiant/VirusTotal Imphash MD5 hash computation over import tables (case folding, extension stripping, ordinal normalization).
+  - Rendered Imphash in both Overview (Hashes) and PE Headers tabs.
+- **Rich PE Header & RichPE Hash**:
+  - Implemented bit-exact Rich Header parser with XOR key detection, `DanS` magic verification, and padding validation.
+  - Decoded CompID build records with MSVC toolchain identifier mapping (Linker, C/C++ Compiler, MASM, Cvtomf, Resource).
+  - Computed standard RichPE header MD5 hash, rendered in Overview and PE Headers tabs.
+- **Linux ELF Static Analysis Support**:
+  - Implemented full ELF parsing module (`src/analysis/elf.rs`) supporting x86, x86-64, ARM, AArch64, MIPS, RISC-V, PowerPC, and s390x binaries.
+  - Added binary hardening & mitigation inspection: Non-Executable stack (`NX` via `PT_GNU_STACK`), Position-Independent Executable (`PIE` via `ET_DYN`), `RELRO` (`None`, `Partial`, `Full`), Stack Canary (`__stack_chk_fail`), Fortified Source, and `RPATH`/`RUNPATH` library hijacking detection.
+  - Added section & segment inspection with Shannon entropy calculation, flagging W+X permissions (`PT_LOAD` / sections) and stripped header anomalies.
+  - Added dynamic symbol categorization and API risk scoring for Linux APIs (`ptrace`, `memfd_create`, `process_vm_writev`, `init_module`, etc.).
+  - Added direct system call opcode scan (`syscall`, `sysenter`, `int 0x80`) via `iced-x86`.
+  - Added Linux malware heuristic pattern detection (`Rootkit.Linux`, `Dropper.Fileless.Linux`, `Botnet.IoT.Linux`).
+  - Added dynamic TUI tabs for ELF binaries (`Headers`, `Segments`, `Sections`, `Imports`, `Disasm`) and integrated metadata into the Overview dashboard.
+
+### Changed
+- **Dependency Elimination**:
+  - Removed `color-eyre = "0.6"` and ~15 transitive crates (`eyre`, `indenter`, `owo-colors`, `tracing-error`, etc.) in favor of standard library `std::error::Error`.
+- **Codebase Simplification & Performance (Ponytail Audit)**:
+  - Deduplicated detection check construction (simplified 40+ verbose instantiations via helper) and unified scoring loops for `ApiRisk` and `Anomaly` across PE, ELF, and Mach-O formats (-330 LOC).
+  - Replaced multiple passes over file bytes with single-pass byte frequency distribution, deriving Shannon entropy directly from frequency tables.
+  - Flattened TUI module layout (`src/tui/ui.rs` moved to `src/ui.rs`, removed redundant `src/tui/mod.rs`).
+  - Unified PE, ELF, and Mach-O disassembly rendering into a single shared helper (`draw_binary_disasm`).
+  - Merged duplicate ELF/Mach-O tab dispatch branches in `src/app.rs`.
+  - Simplified TUI initialization and restoration to standard `ratatui::init` / `ratatui::restore`.
+  - Replaced custom endian reading functions with native stdlib slice conversions (`try_into`).
+
+### Fixed
+- **Cross-Platform YARA Cache & Path Resolution**: Fixed `.yara_cache` loading failures on non-Windows platforms:
+  - Normalized rule file path separators to `/` across OSes during SHA-256 fingerprint generation.
+  - Hashed rule file content and size instead of unstable filesystem timestamps (`mtime`).
+  - Added fallback path resolution to `current_exe().parent()` when running the binary outside the repository root directory.
+
 ## [0.3.0] - 2026-07-10
 
 ### Added

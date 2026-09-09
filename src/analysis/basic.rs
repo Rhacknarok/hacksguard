@@ -3,27 +3,22 @@ use sha2::{Digest, Sha256};
 
 /// Run basic (format-agnostic) analysis: hashes, entropy, strings.
 pub fn analyze(data: &[u8]) -> BasicAnalysis {
-    let (((md5, sha1), (sha256, entropy)), (strings, byte_distribution)) = rayon::join(
+    let ((md5, sha1), (sha256, (strings, (byte_distribution, entropy)))) = rayon::join(
         || rayon::join(
-            || rayon::join(
-                || compute_hash::<md5::Md5>(data),
-                || compute_hash::<sha1::Sha1>(data),
-            ),
-            || rayon::join(
-                || compute_hash::<Sha256>(data),
-                || shannon_entropy(data),
-            )
+            || compute_hash::<md5::Md5>(data),
+            || compute_hash::<sha1::Sha1>(data),
         ),
         || rayon::join(
-            || extract_strings(data, 4),
-            || {
-                let mut dist = [0u64; 256];
-                for &b in data {
-                    dist[b as usize] += 1;
-                }
-                dist.to_vec()
-            }
-        )
+            || compute_hash::<Sha256>(data),
+            || rayon::join(
+                || extract_strings(data, 4),
+                || {
+                    let freq = byte_frequencies(data);
+                    let ent = entropy_from_frequencies(&freq, data.len());
+                    (freq.to_vec(), ent)
+                },
+            ),
+        ),
     );
 
     let is_packed = entropy > 7.0;
@@ -42,26 +37,27 @@ pub fn analyze(data: &[u8]) -> BasicAnalysis {
 // ─── Hashing ─────────────────────────────────────────────────────
 
 fn compute_hash<D: Digest>(data: &[u8]) -> String {
-    let mut hasher = D::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    result
+    D::digest(data)
         .iter()
         .map(|b| format!("{:02x}", b))
-        .collect::<String>()
+        .collect()
 }
 
 // ─── Entropy ─────────────────────────────────────────────────────
 
-pub fn shannon_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
+pub fn byte_frequencies(data: &[u8]) -> [u64; 256] {
     let mut freq = [0u64; 256];
     for &b in data {
         freq[b as usize] += 1;
     }
-    let len = data.len() as f64;
+    freq
+}
+
+pub fn entropy_from_frequencies(freq: &[u64; 256], total_len: usize) -> f64 {
+    if total_len == 0 {
+        return 0.0;
+    }
+    let len = total_len as f64;
     freq.iter()
         .filter(|&&c| c > 0)
         .map(|&c| {
@@ -71,12 +67,39 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
         .sum()
 }
 
+pub fn shannon_entropy(data: &[u8]) -> f64 {
+    entropy_from_frequencies(&byte_frequencies(data), data.len())
+}
+
 // ─── String extraction ───────────────────────────────────────────
 
 fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
     let mut results = Vec::new();
     let mut current = Vec::new();
     let mut start_offset = 0;
+
+    let mut push_entry = |buf: &mut Vec<u8>, offset: usize, is_wide: bool| {
+        if buf.len() >= min_len {
+            let s = String::from_utf8_lossy(buf).to_string();
+            let category = categorize_string(&s);
+            let decoded = if is_base64_like(&s) {
+                use base64::{Engine as _, engine::general_purpose};
+                general_purpose::STANDARD.decode(&s).ok().and_then(|b| String::from_utf8(b).ok())
+            } else {
+                None
+            };
+            results.push(ExtractedString {
+                value: s,
+                offset,
+                category,
+                decoded,
+                is_wide,
+            });
+        }
+        buf.clear();
+    };
+
+    let mut ascii_occupied = vec![false; data.len()];
 
     for (i, &b) in data.iter().enumerate() {
         if b.is_ascii_graphic() || b == b' ' {
@@ -86,42 +109,45 @@ fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
             current.push(b);
         } else {
             if current.len() >= min_len {
-                let s = String::from_utf8_lossy(&current).to_string();
-                let category = categorize_string(&s);
-                let decoded = if is_base64_like(&s) {
-                    use base64::{Engine as _, engine::general_purpose};
-                    general_purpose::STANDARD.decode(&s).ok().and_then(|b| String::from_utf8(b).ok())
-                } else {
-                    None
-                };
-                results.push(ExtractedString {
-                    value: s,
-                    offset: start_offset,
-                    category,
-                    decoded,
-                });
+                ascii_occupied[start_offset..start_offset + current.len()].fill(true);
             }
-            current.clear();
+            push_entry(&mut current, start_offset, false);
         }
     }
-    // flush remaining
     if current.len() >= min_len {
-        let s = String::from_utf8_lossy(&current).to_string();
-        let category = categorize_string(&s);
-        let decoded = if is_base64_like(&s) {
-            use base64::{Engine as _, engine::general_purpose};
-            general_purpose::STANDARD.decode(&s).ok().and_then(|b| String::from_utf8(b).ok())
-        } else {
-            None
-        };
-        results.push(ExtractedString {
-            value: s,
-            offset: start_offset,
-            category,
-            decoded,
-        });
+        ascii_occupied[start_offset..start_offset + current.len()].fill(true);
+    }
+    push_entry(&mut current, start_offset, false);
+
+    if data.len() >= 2 {
+        for align in 0..=1 {
+            let mut i = align;
+            while i + 1 < data.len() {
+                let b0 = data[i];
+                let b1 = data[i + 1];
+                if b1 == 0 && (b0.is_ascii_graphic() || b0 == b' ') {
+                    if current.is_empty() {
+                        start_offset = i;
+                    }
+                    current.push(b0);
+                } else {
+                    while !current.is_empty() && start_offset < data.len() && ascii_occupied[start_offset] {
+                        current.remove(0);
+                        start_offset += 2;
+                    }
+                    push_entry(&mut current, start_offset, true);
+                }
+                i += 2;
+            }
+            while !current.is_empty() && start_offset < data.len() && ascii_occupied[start_offset] {
+                current.remove(0);
+                start_offset += 2;
+            }
+            push_entry(&mut current, start_offset, true);
+        }
     }
 
+    results.sort_by_key(|s| s.offset);
     results
 }
 
@@ -138,7 +164,7 @@ fn is_base64_like(s: &str) -> bool {
             return false;
         }
     }
-    s.len() % 4 == 0
+    s.len().is_multiple_of(4)
 }
 
 fn categorize_string(s: &str) -> StringCategory {
@@ -150,8 +176,8 @@ fn categorize_string(s: &str) -> StringCategory {
         return StringCategory::Url;
     }
 
-    // IP addresses (simple pattern)
-    if is_ip_like(&lower) {
+    // IP addresses
+    if lower.parse::<std::net::Ipv4Addr>().is_ok() {
         return StringCategory::IpAddress;
     }
 
@@ -218,12 +244,34 @@ fn categorize_string(s: &str) -> StringCategory {
     StringCategory::Normal
 }
 
-fn is_ip_like(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_ascii_and_wide_strings() {
+        let mut buf = Vec::new();
+        // ASCII string at offset 0
+        buf.extend_from_slice(b"http://malware.evil/test\0");
+        let wide_offset = buf.len();
+        // UTF-16LE string "powershell.exe"
+        for &b in b"powershell.exe" {
+            buf.push(b);
+            buf.push(0);
+        }
+        buf.push(0);
+        buf.push(0);
+
+        let res = extract_strings(&buf, 4);
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].value, "http://malware.evil/test");
+        assert!(!res[0].is_wide);
+        assert_eq!(res[0].category, StringCategory::Url);
+        assert_eq!(res[0].offset, 0);
+
+        assert_eq!(res[1].value, "powershell.exe");
+        assert!(res[1].is_wide);
+        assert_eq!(res[1].category, StringCategory::Command);
+        assert_eq!(res[1].offset, wide_offset);
     }
-    parts
-        .iter()
-        .all(|p| p.parse::<u8>().is_ok() && !p.is_empty())
 }

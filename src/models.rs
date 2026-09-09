@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 // ─── Top-level result ────────────────────────────────────────────
 
 /// Complete analysis result for a single file.
@@ -9,6 +11,8 @@ pub struct AnalysisResult {
     pub file_info: FileInfo,
     pub basic: BasicAnalysis,
     pub pe: Option<PeAnalysis>,
+    pub elf: Option<ElfAnalysis>,
+    pub macho: Option<MachoAnalysis>,
     pub risk_score: u32,
     pub risk_level: RiskLevel,
     pub risk_breakdown: RiskBreakdown,
@@ -16,6 +20,29 @@ pub struct AnalysisResult {
     pub malware_pattern: Option<MalwarePattern>,
     pub yara_matches: Vec<String>,
     pub entropy_graph: Vec<u64>,
+}
+
+impl AnalysisResult {
+    pub fn attach_embedded_pe(&mut self, pe: PeAnalysis) {
+        self.detection_checks.push(DetectionCheck {
+            name: "Embedded PE executable found".into(),
+            triggered: true,
+            severity: DetectionSeverity::Critical,
+        });
+
+        if let Some(ref mut parent_pe) = self.pe {
+            parent_pe.embedded_pe = Some(Box::new(pe));
+        } else {
+            self.pe = Some(pe);
+        }
+
+        let (score, level) = crate::analysis::compute_risk_from_checks(
+            &self.detection_checks,
+            &self.yara_matches,
+        );
+        self.risk_score = score;
+        self.risk_level = level;
+    }
 }
 
 // ─── File info ───────────────────────────────────────────────────
@@ -68,6 +95,7 @@ pub struct ExtractedString {
     pub offset: usize,
     pub category: StringCategory,
     pub decoded: Option<String>,
+    pub is_wide: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +161,45 @@ pub struct PeAnalysis {
     pub direct_syscalls: bool,
     pub indirect_syscalls: bool,
     pub syscall_locations: Vec<SyscallLocation>,
+    pub imphash: Option<String>,
+    pub rich_header: Option<RichHeaderInfo>,
+    pub certificate: Option<CertificateInfo>,
+    pub xor_payloads: Vec<XorPayloadMatch>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct CertificateInfo {
+    pub subject: String,
+    pub issuer: String,
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+    pub digest_algorithm: Option<String>,
+    pub serial_number: Option<String>,
+    pub is_self_signed: bool,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct XorPayloadMatch {
+    pub key: u8,
+    pub offset: usize,
+    pub target_location: String,
+    pub description: String,
+    pub sample_preview: String,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct RichRecord {
+    pub prod_id: u16,
+    pub build: u16,
+    pub count: u32,
+    pub tool_name: Option<String>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct RichHeaderInfo {
+    pub xor_key: u32,
+    pub rich_hash: String,
+    pub records: Vec<RichRecord>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -170,7 +237,7 @@ pub struct DataDirectory {
     pub size: u32,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ImportFunction {
     pub name: String,
     pub risk: ApiRisk,
@@ -196,6 +263,78 @@ impl fmt::Display for ApiRisk {
             Self::None => write!(f, "-"),
         }
     }
+}
+
+// ─── ELF analysis ────────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfAnalysis {
+    pub machine: String,
+    pub class: String,
+    pub endianness: String,
+    pub elf_type: String,
+    pub entry_point: u64,
+    pub is_64bit: bool,
+    pub is_pie: bool,
+    pub interpreter: Option<String>,
+    pub soname: Option<String>,
+    pub program_headers: Vec<ElfProgramHeader>,
+    pub sections: Vec<ElfSectionInfo>,
+    pub libraries: Vec<String>,
+    pub imported_symbols: Vec<ImportFunction>,
+    pub exported_symbols: Vec<String>,
+    pub mitigations: ElfMitigations,
+    pub anomalies: Vec<Anomaly>,
+    pub packer_detected: Option<String>,
+    pub ep_bytes: Vec<u8>,
+    pub direct_syscalls: bool,
+    pub syscall_locations: Vec<SyscallLocation>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfProgramHeader {
+    pub ph_type: String,
+    pub flags: String,
+    pub is_read: bool,
+    pub is_write: bool,
+    pub is_exec: bool,
+    pub virtual_address: u64,
+    pub memory_size: u64,
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub alignment: u64,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfSectionInfo {
+    pub name: String,
+    pub section_type: String,
+    pub virtual_address: u64,
+    pub raw_size: u64,
+    pub raw_offset: u64,
+    pub entropy: f64,
+    pub flags_str: String,
+    pub is_executable: bool,
+    pub is_writable: bool,
+    pub anomalies: Vec<String>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ElfMitigations {
+    pub nx: bool,
+    pub pie: bool,
+    pub relro: ElfRelro,
+    pub stack_canary: bool,
+    pub fortified: bool,
+    pub rpath: Option<String>,
+    pub runpath: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ElfRelro {
+    None,
+    Partial,
+    Full,
 }
 
 // ─── Risk scoring ────────────────────────────────────────────────
@@ -224,7 +363,7 @@ impl fmt::Display for RiskLevel {
 
 // ─── Anomalies ───────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct Anomaly {
     pub severity: AnomalySeverity,
     pub description: String,
@@ -298,4 +437,64 @@ pub struct MalwarePattern {
     pub confidence: String,
     pub description: String,
     pub matched_indicators: Vec<String>,
+}
+
+// ─── Mach-O analysis ─────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoAnalysis {
+    pub cpu_type: String,
+    pub file_type: String,
+    pub flags_str: String,
+    pub entry_point: u64,
+    pub is_64bit: bool,
+    pub is_pie: bool,
+    pub segments: Vec<MachoSegment>,
+    pub sections: Vec<MachoSection>,
+    pub dylibs: Vec<String>,
+    pub rpaths: Vec<String>,
+    pub imported_symbols: Vec<ImportFunction>,
+    pub exported_symbols: Vec<String>,
+    pub mitigations: MachoMitigations,
+    pub anomalies: Vec<Anomaly>,
+    pub has_code_signature: bool,
+    pub ep_bytes: Vec<u8>,
+    pub direct_syscalls: bool,
+    pub syscall_locations: Vec<SyscallLocation>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoSegment {
+    pub name: String,
+    pub vmaddr: u64,
+    pub vmsize: u64,
+    pub fileoff: u64,
+    pub filesize: u64,
+    pub maxprot: String,
+    pub initprot: String,
+    pub is_read: bool,
+    pub is_write: bool,
+    pub is_exec: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoSection {
+    pub sectname: String,
+    pub segname: String,
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u64,
+    pub entropy: f64,
+    pub is_executable: bool,
+    pub is_writable: bool,
+    pub anomalies: Vec<String>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct MachoMitigations {
+    pub pie: bool,
+    pub allow_stack_execution: bool,
+    pub no_heap_execution: bool,
+    pub has_code_signature: bool,
+    pub rpaths: Vec<String>,
 }

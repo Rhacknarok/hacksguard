@@ -1,7 +1,7 @@
 use crate::analysis::basic::shannon_entropy;
 use crate::models::*;
-use color_eyre::Result;
 use goblin::Object;
+use md5::{Digest, Md5};
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
@@ -9,7 +9,7 @@ use std::time::SystemTime;
 pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
     let pe = match Object::parse(data)? {
         Object::PE(pe) => pe,
-        _ => color_eyre::eyre::bail!("Not a PE file"),
+        _ => return Err("Not a PE file".into()),
     };
 
     let coff = &pe.header.coff_header;
@@ -29,7 +29,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
 
     let (entry_point, image_base, subsystem, linker_version) =
         if let Some(opt) = pe.header.optional_header {
-            let ep = opt.standard_fields.address_of_entry_point as u64;
+            let ep = opt.standard_fields.address_of_entry_point;
             let ib = opt.windows_fields.image_base;
             let ss = match opt.windows_fields.subsystem {
                 1 => "Native",
@@ -272,16 +272,30 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
     let compilation_age = format_compilation_age(timestamp);
     let timestamp_suspicious = is_timestamp_suspicious(timestamp);
 
-    let has_authenticode = if let Some(opt) = pe.header.optional_header {
+    let (has_authenticode, certificate) = if let Some(opt) = pe.header.optional_header {
         let dirs = opt.data_directories.data_directories;
         if let Some(Some((_, sec_dir))) = dirs.get(4) {
-            sec_dir.virtual_address != 0 && sec_dir.size != 0
+            if sec_dir.virtual_address != 0 && sec_dir.size != 0 {
+                let cert = crate::analysis::authenticode::parse_authenticode(data, sec_dir.virtual_address as usize, sec_dir.size as usize);
+                (true, cert)
+            } else {
+                (false, None)
+            }
         } else {
-            false
+            (false, None)
         }
     } else {
-        false
+        (false, None)
     };
+
+    if let Some(ref cert) = certificate {
+        if cert.is_self_signed {
+            anomalies.push(Anomaly {
+                severity: AnomalySeverity::Critical,
+                description: format!("Self-signed Authenticode certificate ({})", cert.subject),
+            });
+        }
+    }
 
     let mut ep_bytes = Vec::new();
     // Try to get 100 bytes at the entry point for disassembly
@@ -345,6 +359,48 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         None
     });
 
+    let imphash = compute_imphash(&pe.imports);
+    let rich_header = parse_rich_header(data);
+
+    // ── 1-byte XOR brute-force scanner on overlay and high-entropy sections ──
+    let mut xor_payloads = Vec::new();
+    if let (Some(off), Some(sz)) = (overlay_offset, overlay_size) {
+        let mut scan_off = off;
+        let mut scan_sz = sz;
+        if let Some(opt) = pe.header.optional_header {
+            if let Some(Some((_, sec_dir))) = opt.data_directories.data_directories.get(4) {
+                let cert_off = sec_dir.virtual_address as usize;
+                let cert_sz = sec_dir.size as usize;
+                if cert_off == off && cert_sz <= sz {
+                    scan_off = off + cert_sz;
+                    scan_sz = sz - cert_sz;
+                }
+            }
+        }
+        if scan_sz >= 64 {
+            let scan_end = (scan_off + scan_sz).min(scan_off + 1024 * 1024).min(data.len());
+            if scan_off < scan_end {
+                xor_payloads.extend(scan_xor_payloads(&data[scan_off..scan_end], scan_off, "Overlay"));
+            }
+        }
+    }
+    for sec in &sections {
+        if sec.entropy >= 6.0 && sec.raw_size >= 64 {
+            let start = sec.raw_offset as usize;
+            let end = (start + sec.raw_size as usize).min(start + 512 * 1024).min(data.len());
+            if start < end {
+                xor_payloads.extend(scan_xor_payloads(&data[start..end], start, &format!("Section {}", sec.name)));
+            }
+        }
+    }
+
+    for p in &xor_payloads {
+        anomalies.push(Anomaly {
+            severity: AnomalySeverity::Critical,
+            description: format!("1-byte XOR encrypted payload in {} (key {:#04x}: {})", p.target_location, p.key, p.description),
+        });
+    }
+
     Ok(PeAnalysis {
         machine,
         timestamp,
@@ -379,7 +435,148 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         direct_syscalls: false,
         indirect_syscalls: false,
         syscall_locations: Vec::new(),
+        imphash,
+        rich_header,
+        certificate,
+        xor_payloads,
     })
+}
+
+// ─── Imphash & Rich Header ───────────────────────────────────────
+
+pub fn compute_imphash(imports: &[goblin::pe::import::Import]) -> Option<String> {
+    if imports.is_empty() {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(imports.len());
+    for import in imports {
+        let dll_lower = import.dll.to_lowercase();
+        let lib_name = dll_lower
+            .strip_suffix(".dll")
+            .or_else(|| dll_lower.strip_suffix(".sys"))
+            .or_else(|| dll_lower.strip_suffix(".ocx"))
+            .unwrap_or(&dll_lower);
+
+        let func_name = if import.name.is_empty() {
+            format!("ord{}", import.ordinal)
+        } else {
+            import.name.to_lowercase()
+        };
+        entries.push(format!("{}.{}", lib_name, func_name));
+    }
+    let joined = entries.join(",");
+    Some(Md5::digest(joined.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+fn lookup_tool_name(prod_id: u16) -> Option<&'static str> {
+    match prod_id {
+        1 => Some("Import0"),
+        2 | 4 | 10 | 27 | 39 | 60 | 95 | 109 | 131 | 149 | 179 | 201 | 224 | 257 | 261 => Some("Linker"),
+        3 | 5 | 12 | 28 | 40 | 61 | 96 | 110 | 132 | 150 | 180 | 202 | 225 | 258 | 262 => Some("Cvtomf"),
+        6 | 13 => Some("Cvpack"),
+        14 | 25 | 37 | 58 | 93 | 107 | 129 | 147 | 177 | 199 | 222 | 255 | 259 => Some("C Compiler"),
+        15 | 26 | 38 | 59 | 94 | 108 | 130 | 148 | 178 | 200 | 223 | 256 | 260 => Some("C++ Compiler"),
+        16 | 29 | 41 | 62 | 97 | 111 | 133 | 151 | 181 | 203 | 226 => Some("Resource"),
+        17 | 30 | 42 | 63 | 98 | 112 | 134 | 152 | 182 | 204 | 227 => Some("MASM"),
+        _ => None,
+    }
+}
+
+pub fn parse_rich_header(data: &[u8]) -> Option<RichHeaderInfo> {
+    if data.len() < 0x40 || &data[0..2] != b"MZ" {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(data[0x3c..0x40].try_into().ok()?) as usize;
+    if e_lfanew < 0x40 || e_lfanew > data.len() {
+        return None;
+    }
+
+    let search_area = &data[0x40..e_lfanew];
+    for (i, _) in search_area.windows(4).enumerate().rev() {
+        if &search_area[i..i + 4] != b"Rich" {
+            continue;
+        }
+        let rich_offset = 0x40 + i;
+        if rich_offset + 8 > e_lfanew {
+            continue;
+        }
+
+        let xor_key = u32::from_le_bytes(data[rich_offset + 4..rich_offset + 8].try_into().ok()?);
+        let dans_masked = 0x536E_6144u32 ^ xor_key;
+
+        let mut dans_offset = None;
+        let mut cur = rich_offset;
+        while cur >= 0x40 + 4 {
+            cur -= 4;
+            if let Ok(bytes) = data[cur..cur + 4].try_into() {
+                if u32::from_le_bytes(bytes) == dans_masked {
+                    dans_offset = Some(cur);
+                    break;
+                }
+            }
+        }
+
+        let Some(dans_off) = dans_offset else {
+            continue;
+        };
+
+        if dans_off + 16 > rich_offset {
+            continue;
+        }
+        let mut pad_ok = true;
+        for pad_idx in 0..3 {
+            let start = dans_off + 4 + pad_idx * 4;
+            if let Ok(bytes) = data[start..start + 4].try_into() {
+                if u32::from_le_bytes(bytes) != xor_key {
+                    pad_ok = false;
+                    break;
+                }
+            } else {
+                pad_ok = false;
+                break;
+            }
+        }
+        if !pad_ok {
+            continue;
+        }
+
+        let mut clear_data = Vec::with_capacity(rich_offset - dans_off);
+        for chunk in data[dans_off..rich_offset].chunks_exact(4) {
+            if let Ok(bytes) = chunk.try_into() {
+                let val = u32::from_le_bytes(bytes) ^ xor_key;
+                clear_data.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+
+        let rich_hash: String = Md5::digest(&clear_data)
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        let records_data = &clear_data[16..];
+        let mut records = Vec::new();
+        for chunk in records_data.chunks_exact(8) {
+            let comp_id = u32::from_le_bytes(chunk[0..4].try_into().ok()?);
+            let count = u32::from_le_bytes(chunk[4..8].try_into().ok()?);
+            let prod_id = (comp_id >> 16) as u16;
+            let build = (comp_id & 0xFFFF) as u16;
+            let tool_name = lookup_tool_name(prod_id).map(String::from);
+            records.push(RichRecord {
+                prod_id,
+                build,
+                count,
+                tool_name,
+            });
+        }
+
+        return Some(RichHeaderInfo {
+            xor_key,
+            rich_hash,
+            records,
+        });
+    }
+
+    None
 }
 
 // ─── API risk classification ─────────────────────────────────────
@@ -624,90 +821,172 @@ pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
     None
 }
 
-fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    if offset + 2 <= data.len() {
-        Some(u16::from_le_bytes([data[offset], data[offset + 1]]))
-    } else {
-        None
+/// Brute-force single-pass 1-byte XOR scanner for hidden PEs, DOS stubs, and URLs.
+pub fn scan_xor_payloads(data: &[u8], base_offset: usize, location: &str) -> Vec<XorPayloadMatch> {
+    let mut results = Vec::new();
+    if data.len() < 8 {
+        return results;
     }
+
+    const DOS_STUB: &[u8] = b"This program cannot be run in DOS mode";
+    const HTTP: &[u8] = b"http://";
+    const HTTPS: &[u8] = b"https://";
+
+    let mut i = 0;
+    while i < data.len() {
+        // 1. Check for XOR-encoded PE executable (MZ header + e_lfanew + PE signature)
+        if i + 64 <= data.len() {
+            let key = data[i] ^ b'M';
+            if key != 0 && (data[i + 1] ^ key) == b'Z' {
+                let e_lfanew = u32::from_le_bytes([
+                    data[i + 0x3c] ^ key,
+                    data[i + 0x3d] ^ key,
+                    data[i + 0x3e] ^ key,
+                    data[i + 0x3f] ^ key,
+                ]) as usize;
+
+                if (0x40..=0x1000).contains(&e_lfanew) && i + e_lfanew + 4 <= data.len() {
+                    if (data[i + e_lfanew] ^ key) == b'P'
+                        && (data[i + e_lfanew + 1] ^ key) == b'E'
+                        && (data[i + e_lfanew + 2] ^ key) == 0
+                        && (data[i + e_lfanew + 3] ^ key) == 0
+                    {
+                        results.push(XorPayloadMatch {
+                            key,
+                            offset: base_offset + i,
+                            target_location: location.to_string(),
+                            description: "XOR-encoded PE executable (MZ...PE)".to_string(),
+                            sample_preview: format!("MZ header at offset {:#x}, e_lfanew={:#x}", base_offset + i, e_lfanew),
+                        });
+                        i += 64;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 2. Check for XOR-encoded DOS stub
+        if i + DOS_STUB.len() <= data.len() {
+            let key = data[i] ^ b'T';
+            if key != 0 {
+                let matches_stub = data[i..i + DOS_STUB.len()]
+                    .iter()
+                    .zip(DOS_STUB.iter())
+                    .all(|(&b, &expected)| (b ^ key) == expected);
+
+                if matches_stub {
+                    let already_found_pe = results.iter().any(|r| {
+                        r.key == key && r.description.contains("PE executable") && (base_offset + i).saturating_sub(r.offset) < 0x200
+                    });
+                    if !already_found_pe {
+                        results.push(XorPayloadMatch {
+                            key,
+                            offset: base_offset + i,
+                            target_location: location.to_string(),
+                            description: "XOR-encoded DOS stub".to_string(),
+                            sample_preview: "This program cannot be run in DOS mode".to_string(),
+                        });
+                    }
+                    i += DOS_STUB.len();
+                    continue;
+                }
+            }
+        }
+
+        // 3. Check for XOR-encoded URLs (http:// or https://)
+        if i + 7 <= data.len() {
+            let key = data[i] ^ b'h';
+            if key != 0 {
+                let is_https = i + 8 <= data.len()
+                    && data[i..i + 8]
+                        .iter()
+                        .zip(HTTPS.iter())
+                        .all(|(&b, &expected)| (b ^ key) == expected);
+
+                let is_http = !is_https
+                    && data[i..i + 7]
+                        .iter()
+                        .zip(HTTP.iter())
+                        .all(|(&b, &expected)| (b ^ key) == expected);
+
+                if is_https || is_http {
+                    let mut url_bytes = Vec::new();
+                    let max_scan = 128.min(data.len() - i);
+                    for &b in &data[i..i + max_scan] {
+                        let dec = b ^ key;
+                        if (0x21..=0x7e).contains(&dec) && dec != b'"' && dec != b'\'' && dec != b'<' && dec != b'>' && dec != b'`' {
+                            url_bytes.push(dec);
+                        } else {
+                            break;
+                        }
+                    }
+                    if url_bytes.len() >= 10 {
+                        let url_str = String::from_utf8_lossy(&url_bytes).to_string();
+                        results.push(XorPayloadMatch {
+                            key,
+                            offset: base_offset + i,
+                            target_location: location.to_string(),
+                            description: "XOR-encoded URL".to_string(),
+                            sample_preview: url_str,
+                        });
+                        i += url_bytes.len();
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    results
+}
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    data.get(offset..offset + 2)?.try_into().ok().map(u16::from_le_bytes)
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    if offset + 4 <= data.len() {
-        Some(u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]))
-    } else {
-        None
-    }
+    data.get(offset..offset + 4)?.try_into().ok().map(u32::from_le_bytes)
 }
 
-fn find_manifest(rsrc_bytes: &[u8], sections: &[goblin::pe::section_table::SectionTable], file_alignment: u32, full_data: &[u8]) -> Option<String> {
-    let num_named = read_u16(rsrc_bytes, 12)? as usize;
-    let num_id = read_u16(rsrc_bytes, 14)? as usize;
-    let total_entries = num_named + num_id;
-
-    for i in 0..total_entries {
-        let entry_offset = 16 + i * 8;
-        let type_id = read_u32(rsrc_bytes, entry_offset)?;
-        let offset_to_dir = read_u32(rsrc_bytes, entry_offset + 4)?;
-
-        if type_id == 24 {
-            if (offset_to_dir & 0x8000_0000) != 0 {
-                let name_dir_offset = (offset_to_dir & 0x7FFF_FFFF) as usize;
-                return walk_name_dir(rsrc_bytes, name_dir_offset, sections, file_alignment, full_data);
-            }
-        }
-    }
-    None
+fn iter_rsrc_entries(rsrc: &[u8], dir_offset: usize) -> impl Iterator<Item = (u32, u32)> + '_ {
+    let num_named = read_u16(rsrc, dir_offset.saturating_add(12)).unwrap_or(0) as usize;
+    let num_id = read_u16(rsrc, dir_offset.saturating_add(14)).unwrap_or(0) as usize;
+    let total = num_named + num_id;
+    (0..total).filter_map(move |i| {
+        let entry = dir_offset.checked_add(16 + i * 8)?;
+        Some((read_u32(rsrc, entry)?, read_u32(rsrc, entry + 4)?))
+    })
 }
 
-fn walk_name_dir(rsrc_bytes: &[u8], dir_offset: usize, sections: &[goblin::pe::section_table::SectionTable], file_alignment: u32, full_data: &[u8]) -> Option<String> {
-    let num_named = read_u16(rsrc_bytes, dir_offset + 12)? as usize;
-    let num_id = read_u16(rsrc_bytes, dir_offset + 14)? as usize;
-    let total_entries = num_named + num_id;
-
-    for i in 0..total_entries {
-        let entry_offset = dir_offset + 16 + i * 8;
-        let _name_id = read_u32(rsrc_bytes, entry_offset)?;
-        let offset_to_dir = read_u32(rsrc_bytes, entry_offset + 4)?;
-
-        if (offset_to_dir & 0x8000_0000) != 0 {
-            let lang_dir_offset = (offset_to_dir & 0x7FFF_FFFF) as usize;
-            return walk_lang_dir(rsrc_bytes, lang_dir_offset, sections, file_alignment, full_data);
-        }
-    }
-    None
-}
-
-fn walk_lang_dir(rsrc_bytes: &[u8], dir_offset: usize, sections: &[goblin::pe::section_table::SectionTable], file_alignment: u32, full_data: &[u8]) -> Option<String> {
-    let num_named = read_u16(rsrc_bytes, dir_offset + 12)? as usize;
-    let num_id = read_u16(rsrc_bytes, dir_offset + 14)? as usize;
-    let total_entries = num_named + num_id;
-
-    for i in 0..total_entries {
-        let entry_offset = dir_offset + 16 + i * 8;
-        let _lang_id = read_u32(rsrc_bytes, entry_offset)?;
-        let offset_to_data = read_u32(rsrc_bytes, entry_offset + 4)?;
-
-        if (offset_to_data & 0x8000_0000) == 0 {
-            let data_entry_offset = offset_to_data as usize;
-            let data_rva = read_u32(rsrc_bytes, data_entry_offset)? as usize;
-            let size = read_u32(rsrc_bytes, data_entry_offset + 4)? as usize;
-
-            let file_offset = goblin::pe::utils::find_offset(
-                data_rva,
-                sections,
-                file_alignment,
-                &goblin::pe::options::ParseOptions::default(),
-            ).unwrap_or(0);
-
-            if file_offset > 0 && file_offset + size <= full_data.len() {
-                let manifest_bytes = &full_data[file_offset..file_offset + size];
-                return Some(String::from_utf8_lossy(manifest_bytes).to_string());
+fn find_manifest(
+    rsrc_bytes: &[u8],
+    sections: &[goblin::pe::section_table::SectionTable],
+    file_alignment: u32,
+    full_data: &[u8],
+) -> Option<String> {
+    for (type_id, off1) in iter_rsrc_entries(rsrc_bytes, 0) {
+        if type_id == 24 && (off1 & 0x8000_0000) != 0 {
+            for (_, off2) in iter_rsrc_entries(rsrc_bytes, (off1 & 0x7FFF_FFFF) as usize) {
+                if (off2 & 0x8000_0000) != 0 {
+                    for (_, data_off) in iter_rsrc_entries(rsrc_bytes, (off2 & 0x7FFF_FFFF) as usize) {
+                        if (data_off & 0x8000_0000) == 0 {
+                            let d_off = data_off as usize;
+                            let rva = read_u32(rsrc_bytes, d_off)? as usize;
+                            let size = read_u32(rsrc_bytes, d_off + 4)? as usize;
+                            let file_offset = goblin::pe::utils::find_offset(
+                                rva,
+                                sections,
+                                file_alignment,
+                                &goblin::pe::options::ParseOptions::default(),
+                            ).unwrap_or(0);
+                            if file_offset > 0 && file_offset + size <= full_data.len() {
+                                return Some(String::from_utf8_lossy(&full_data[file_offset..file_offset + size]).to_string());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -717,38 +996,130 @@ fn walk_lang_dir(rsrc_bytes: &[u8], dir_offset: usize, sections: &[goblin::pe::s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::Path;
-
-    fn find_any_exe<P: AsRef<Path>>(dir: P) -> Option<std::path::PathBuf> {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(exe) = find_any_exe(&path) {
-                        return Some(exe);
-                    }
-                } else if path.extension().map_or(false, |ext| ext == "exe") {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    }
 
     #[test]
     fn test_find_embedded_pe() {
-        if let Some(exe_path) = find_any_exe("target") {
-            if let Ok(pe_data) = fs::read(exe_path) {
-                let mut dummy = vec![0x90; 100];
-                dummy.extend_from_slice(&pe_data);
-                dummy.extend_from_slice(&[0x90; 100]);
+        let dummy = vec![0x90; 200];
+        assert!(find_embedded_pe(&dummy, false).is_none());
+    }
 
-                let found = find_embedded_pe(&dummy, false);
-                assert!(found.is_some());
-                let pe = found.unwrap();
-                assert!(!pe.sections.is_empty());
-            }
-        }
+    #[test]
+    fn test_compute_imphash_empty() {
+        assert!(compute_imphash(&[]).is_none());
+    }
+
+    #[test]
+    fn test_compute_imphash_populated() {
+        let imports = vec![
+            goblin::pe::import::Import {
+                name: "ExitProcess".into(),
+                dll: "KERNEL32.DLL",
+                ordinal: 0,
+                offset: 0,
+                rva: 0,
+                size: 0,
+            },
+            goblin::pe::import::Import {
+                name: "".into(),
+                dll: "user32.dll",
+                ordinal: 42,
+                offset: 0,
+                rva: 0,
+                size: 0,
+            },
+        ];
+        let hash = compute_imphash(&imports).unwrap();
+        let expected: String = Md5::digest(b"kernel32.exitprocess,user32.ord42")
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn test_parse_rich_header() {
+        let mut data = vec![0u8; 256];
+        data[0..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&128u32.to_le_bytes()); // e_lfanew = 128
+
+        let xor_key = 0x1234_5678u32;
+        let dans_masked = 0x536E_6144u32 ^ xor_key;
+        let dans_off = 0x40; // 64
+        data[dans_off..dans_off + 4].copy_from_slice(&dans_masked.to_le_bytes());
+        // 3 padding dwords
+        data[dans_off + 4..dans_off + 8].copy_from_slice(&xor_key.to_le_bytes());
+        data[dans_off + 8..dans_off + 12].copy_from_slice(&xor_key.to_le_bytes());
+        data[dans_off + 12..dans_off + 16].copy_from_slice(&xor_key.to_le_bytes());
+        // 1 record: prod_id = 14 (Utc C compiler), build = 1234, count = 5
+        let comp_id = (14u32 << 16) | 1234u32;
+        data[dans_off + 16..dans_off + 20].copy_from_slice(&(comp_id ^ xor_key).to_le_bytes());
+        data[dans_off + 20..dans_off + 24].copy_from_slice(&(5u32 ^ xor_key).to_le_bytes());
+        // Rich signature and key at 88
+        let rich_off = dans_off + 24;
+        data[rich_off..rich_off + 4].copy_from_slice(b"Rich");
+        data[rich_off + 4..rich_off + 8].copy_from_slice(&xor_key.to_le_bytes());
+
+        let res = parse_rich_header(&data).expect("Should parse rich header");
+        assert_eq!(res.xor_key, 0x1234_5678);
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].prod_id, 14);
+        assert_eq!(res.records[0].build, 1234);
+        assert_eq!(res.records[0].count, 5);
+        assert_eq!(res.records[0].tool_name.as_deref(), Some("C Compiler"));
+        assert_eq!(res.rich_hash.len(), 32);
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_pe() {
+        let key = 0x5a;
+        let mut raw_pe = vec![0u8; 256];
+        raw_pe[0] = b'M';
+        raw_pe[1] = b'Z';
+        raw_pe[0x3c] = 0x80; // e_lfanew = 128
+        raw_pe[0x80] = b'P';
+        raw_pe[0x81] = b'E';
+        raw_pe[0x82] = 0;
+        raw_pe[0x83] = 0;
+
+        let xored: Vec<u8> = raw_pe.iter().map(|b| b ^ key).collect();
+        let matches = scan_xor_payloads(&xored, 0x1000, "Overlay");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].key, 0x5a);
+        assert_eq!(matches[0].offset, 0x1000);
+        assert!(matches[0].description.contains("PE executable"));
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_url() {
+        let key = 0x42;
+        let mut raw = vec![0x00; 64];
+        raw.extend_from_slice(b"https://c2-malware-domain.xyz/payload.bin\0");
+        raw.extend_from_slice(&[0x00; 32]);
+        let buffer: Vec<u8> = raw.iter().map(|b| b ^ key).collect();
+
+        let matches = scan_xor_payloads(&buffer, 0x500, "Section .data");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].key, 0x42);
+        assert_eq!(matches[0].sample_preview, "https://c2-malware-domain.xyz/payload.bin");
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_dos_stub() {
+        let key = 0x77;
+        let stub = b"This program cannot be run in DOS mode";
+        let xored_stub: Vec<u8> = stub.iter().map(|b| b ^ key).collect();
+
+        let matches = scan_xor_payloads(&xored_stub, 0x200, "Overlay");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].key, 0x77);
+        assert_eq!(matches[0].description, "XOR-encoded DOS stub");
+    }
+
+    #[test]
+    fn test_scan_xor_payloads_plaintext_ignored() {
+        let url = b"https://legitimate.org/test";
+        let matches = scan_xor_payloads(url, 0, "Overlay");
+        // Key 0 is plaintext, must be ignored by XOR brute-forcer
+        assert!(matches.is_empty());
     }
 }

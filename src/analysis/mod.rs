@@ -1,8 +1,10 @@
 pub mod basic;
 pub mod pe;
+pub mod elf;
+pub mod macho;
+pub mod authenticode;
 
 use crate::models::*;
-use color_eyre::Result;
 use std::path::Path;
 
 /// Run the full analysis pipeline on a file.
@@ -26,7 +28,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
     };
 
     let data_ref = &data;
-    let (basic_result, entropy_graph, pe_result, yara_matches) = std::thread::scope(|s| {
+    let (basic_result, entropy_graph, pe_result, elf_result, macho_result, yara_matches) = std::thread::scope(|s| {
         let tx1 = progress_tx.clone();
         let basic_handle = s.spawn(move || {
             let res = basic::analyze(data_ref);
@@ -42,14 +44,15 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         });
 
         let tx3 = progress_tx.clone();
-        let pe_handle = s.spawn(move || {
-            let res = if file_type == FileType::PE {
-                pe::analyze(data_ref).ok()
-            } else {
-                None
+        let binary_handle = s.spawn(move || {
+            let (pe, elf, macho) = match file_type {
+                FileType::PE => (pe::analyze(data_ref).ok(), None, None),
+                FileType::ELF => (None, elf::analyze(data_ref).ok(), None),
+                FileType::MachO => (None, None, macho::analyze(data_ref).ok()),
+                _ => (None, None, None),
             };
             if let Some(tx) = &tx3 { let _ = tx.send(()); }
-            res
+            (pe, elf, macho)
         });
 
         let yara_handle = if run_yara {
@@ -65,14 +68,14 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
         let basic = basic_handle.join().unwrap();
         let entropy = entropy_handle.join().unwrap();
-        let pe = pe_handle.join().unwrap();
+        let (pe, elf, macho) = binary_handle.join().unwrap();
         let yara = if let Some(h) = yara_handle {
             h.join().unwrap()
         } else {
             Vec::new()
         };
 
-        (basic, entropy, pe, yara)
+        (basic, entropy, pe, elf, macho, yara)
     });
 
     let mut pe_result = pe_result;
@@ -151,15 +154,17 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         }
     }
 
-    let detection_checks = build_detection_checks(&basic_result, &pe_result, file_info.size);
+    let detection_checks = build_detection_checks(&basic_result, &pe_result, &elf_result, &macho_result, file_info.size);
     let (risk_score, risk_level) = compute_risk_from_checks(&detection_checks, &yara_matches);
-    let (_, _, risk_breakdown) = compute_risk(&basic_result, &pe_result);
-    let malware_pattern = detect_malware_pattern(&basic_result, &pe_result);
+    let risk_breakdown = compute_risk_breakdown(&basic_result, &pe_result, &elf_result, &macho_result);
+    let malware_pattern = detect_malware_pattern(&basic_result, &pe_result, &elf_result, &macho_result);
 
     Ok(AnalysisResult {
         file_info,
         basic: basic_result,
         pe: pe_result,
+        elf: elf_result,
+        macho: macho_result,
         risk_score,
         risk_level,
         risk_breakdown,
@@ -174,7 +179,7 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
     if data.is_empty() {
         return vec![0; num_chunks];
     }
-    let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
+    let chunk_size = data.len().div_ceil(num_chunks);
     
     use rayon::prelude::*;
     let mut graph: Vec<u64> = data.par_chunks(chunk_size)
@@ -197,6 +202,18 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
 
 const YARA_CACHE_PATH: &str = ".yara_cache";
 
+fn resolve_app_path(name: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(name);
+    if p.exists() {
+        return p.to_path_buf();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
 fn visit_dirs(dir: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -212,26 +229,24 @@ fn visit_dirs(dir: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
 
 /// Compute a SHA-256 fingerprint over all rule file paths + their contents.
 /// Any change in file names, order, or content will invalidate the cache.
-fn compute_rules_fingerprint() -> Vec<u8> {
+fn compute_rules_fingerprint(rules_dir: &std::path::Path) -> Vec<u8> {
     use sha2::{Sha256, Digest};
 
     let mut hasher = Sha256::new();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
-    visit_dirs(std::path::Path::new("rules"), &mut paths);
+    visit_dirs(rules_dir, &mut paths);
     // Sort for deterministic ordering
     paths.sort();
 
     for path in &paths {
-        hasher.update(path.to_string_lossy().as_bytes());
-        if let Ok(meta) = std::fs::metadata(path) {
-            hasher.update(&meta.len().to_le_bytes());
-            if let Ok(mtime) = meta.modified() {
-                if let Ok(dur) = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-                    hasher.update(&dur.as_secs().to_le_bytes());
-                    hasher.update(&dur.subsec_nanos().to_le_bytes());
-                }
-            }
+        let rel_path = path.strip_prefix(rules_dir).unwrap_or(path);
+        let normalized = rel_path.to_string_lossy().replace('\\', "/");
+        hasher.update(normalized.as_bytes());
+
+        if let Ok(content) = std::fs::read(path) {
+            hasher.update(&(content.len() as u64).to_le_bytes());
+            hasher.update(&content);
         }
     }
 
@@ -242,10 +257,12 @@ fn compute_rules_fingerprint() -> Vec<u8> {
 ///
 /// Cache format: [32 bytes fingerprint][boreal-serialized Scanner]
 pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
-    let fingerprint = compute_rules_fingerprint();
+    let rules_dir = resolve_app_path("rules");
+    let cache_path = resolve_app_path(YARA_CACHE_PATH);
+    let fingerprint = compute_rules_fingerprint(&rules_dir);
 
     // Try loading from cache
-    if let Ok(cache_bytes) = std::fs::read(YARA_CACHE_PATH) {
+    if let Ok(cache_bytes) = std::fs::read(&cache_path) {
         if cache_bytes.len() > 32 && cache_bytes[..32] == fingerprint[..] {
             let params = boreal::scanner::DeserializeParams::default();
             if let Ok(scanner) = boreal::scanner::Scanner::from_bytes_unchecked(&cache_bytes[32..], params) {
@@ -261,7 +278,7 @@ pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
     // Cache miss or invalid → recompile
     let mut compiler = boreal::Compiler::new();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    visit_dirs(std::path::Path::new("rules"), &mut paths);
+    visit_dirs(&rules_dir, &mut paths);
     paths.sort();
     for path in &paths {
         let _ = compiler.add_rules_file(path);
@@ -274,7 +291,7 @@ pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
         let mut cache = Vec::with_capacity(32 + serialized.len());
         cache.extend_from_slice(&fingerprint);
         cache.extend_from_slice(&serialized);
-        let _ = std::fs::write(YARA_CACHE_PATH, &cache);
+        let _ = std::fs::write(&cache_path, &cache);
     }
 
     let res = match scanner.scan_mem(data) {
@@ -293,7 +310,11 @@ fn detect_type(magic: &[u8]) -> FileType {
         && ((magic[0..4] == [0xFE, 0xED, 0xFA, 0xCE])
             || (magic[0..4] == [0xFE, 0xED, 0xFA, 0xCF])
             || (magic[0..4] == [0xCE, 0xFA, 0xED, 0xFE])
-            || (magic[0..4] == [0xCF, 0xFA, 0xED, 0xFE]))
+            || (magic[0..4] == [0xCF, 0xFA, 0xED, 0xFE])
+            || (magic[0..4] == [0xCA, 0xFE, 0xBA, 0xBE])
+            || (magic[0..4] == [0xBE, 0xBA, 0xFE, 0xCA])
+            || (magic[0..4] == [0xCA, 0xFE, 0xBA, 0xBF])
+            || (magic[0..4] == [0xBF, 0xBA, 0xFE, 0xCA]))
     {
         FileType::MachO
     } else {
@@ -349,10 +370,7 @@ pub fn compute_risk_from_checks(checks: &[DetectionCheck], yara_matches: &[Strin
     (score, level)
 }
 
-fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLevel, RiskBreakdown) {
-    let mut score: u32 = 0;
-
-    // Entropy
+fn compute_risk_breakdown(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>) -> RiskBreakdown {
     let entropy_score = if basic.entropy > 7.5 {
         25
     } else if basic.entropy > 7.0 {
@@ -362,199 +380,154 @@ fn compute_risk(basic: &BasicAnalysis, pe: &Option<PeAnalysis>) -> (u32, RiskLev
     } else {
         0
     };
-    score += entropy_score;
 
-    // Packing
-    let packing_score = if basic.is_packed { 15 } else { 0 };
-    score += packing_score;
+    let is_packed = basic.is_packed || pe.as_ref().is_some_and(|p| p.packer_detected.is_some()) || elf.as_ref().is_some_and(|e| e.packer_detected.is_some());
+    let packing_score = if is_packed { 15 } else { 0 };
 
-    // Suspicious strings
     let sus = basic
         .strings
         .iter()
         .filter(|s| !matches!(s.category, StringCategory::Normal))
         .count() as u32;
     let string_score = sus.min(15);
-    score += string_score;
 
-    // API risk + anomalies (PE-only)
     let mut api_score: u32 = 0;
     let mut anomaly_score: u32 = 0;
 
-    if let Some(pe) = pe {
-        for dll in &pe.imports {
-            for func in &dll.functions {
-                match func.risk {
-                    ApiRisk::Critical => api_score += 8,
-                    ApiRisk::High => api_score += 4,
-                    ApiRisk::Medium => api_score += 1,
-                    _ => {}
-                }
-            }
+    let mut add_scores = |apis: &mut dyn Iterator<Item = ApiRisk>, anoms: &[Anomaly]| {
+        for risk in apis {
+            api_score += match risk {
+                ApiRisk::Critical => 8,
+                ApiRisk::High => 4,
+                ApiRisk::Medium => 1,
+                _ => 0,
+            };
         }
-        api_score = api_score.min(25);
-        score += api_score;
+        for a in anoms {
+            anomaly_score += match a.severity {
+                AnomalySeverity::Critical => 12,
+                AnomalySeverity::Warning => 4,
+                AnomalySeverity::Info => 0,
+            };
+        }
+    };
 
-        for a in &pe.anomalies {
-            match a.severity {
-                AnomalySeverity::Critical => anomaly_score += 12,
-                AnomalySeverity::Warning => anomaly_score += 4,
-                AnomalySeverity::Info => {}
-            }
-        }
-        anomaly_score = anomaly_score.min(25);
-        score += anomaly_score;
+    if let Some(pe) = pe {
+        add_scores(&mut pe.imports.iter().flat_map(|dll| dll.functions.iter().map(|f| f.risk)), &pe.anomalies);
+    } else if let Some(elf) = elf {
+        add_scores(&mut elf.imported_symbols.iter().map(|f| f.risk), &elf.anomalies);
+    } else if let Some(macho) = macho {
+        add_scores(&mut macho.imported_symbols.iter().map(|f| f.risk), &macho.anomalies);
     }
 
-    let score = score.min(100);
-    let level = match score {
-        0..=20 => RiskLevel::Clean,
-        21..=40 => RiskLevel::Low,
-        41..=60 => RiskLevel::Medium,
-        61..=80 => RiskLevel::High,
-        _ => RiskLevel::Critical,
-    };
-
-    let breakdown = RiskBreakdown {
+    RiskBreakdown {
         entropy_score,
-        api_score,
-        anomaly_score,
+        api_score: api_score.min(25),
+        anomaly_score: anomaly_score.min(25),
         string_score,
         packing_score,
-    };
-
-    (score, level, breakdown)
+    }
 }
 
 // ─── Detection checks ───────────────────────────────────────────
 
-fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
-    let mut checks = Vec::with_capacity(23);
+fn has_imported_api(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>, names: &[&str]) -> bool {
+    if let Some(pe) = pe {
+        if pe.imports.iter().any(|dll| {
+            dll.functions.iter().any(|f| {
+                names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
+            })
+        }) {
+            return true;
+        }
+    }
+    if let Some(elf) = elf {
+        if elf.imported_symbols.iter().any(|f| {
+            names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
+        }) {
+            return true;
+        }
+    }
+    if let Some(macho) = macho {
+        if macho.imported_symbols.iter().any(|f| {
+            let clean = f.name.strip_prefix('_').unwrap_or(&f.name);
+            names.iter().any(|n| clean.eq_ignore_ascii_case(n) || f.name.eq_ignore_ascii_case(n))
+        }) {
+            return true;
+        }
+    }
+    false
+}
 
-    // Helper: check if any string matches a category
+fn has_all_imported_apis(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>, names: &[&str]) -> bool {
+    if let Some(pe) = pe {
+        names.iter().all(|name| {
+            pe.imports.iter().any(|dll| {
+                dll.functions.iter().any(|f| f.name.eq_ignore_ascii_case(name))
+            })
+        })
+    } else if let Some(elf) = elf {
+        names.iter().all(|name| {
+            elf.imported_symbols.iter().any(|f| f.name.eq_ignore_ascii_case(name))
+        })
+    } else if let Some(macho) = macho {
+        names.iter().all(|name| {
+            macho.imported_symbols.iter().any(|f| {
+                let clean = f.name.strip_prefix('_').unwrap_or(&f.name);
+                clean.eq_ignore_ascii_case(name) || f.name.eq_ignore_ascii_case(name)
+            })
+        })
+    } else {
+        false
+    }
+}
+
+fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &Option<MachoAnalysis>, file_size: u64) -> Vec<DetectionCheck> {
+    let mut checks = Vec::with_capacity(40);
+    let mut check = |name: &str, triggered: bool, severity: DetectionSeverity| {
+        checks.push(DetectionCheck {
+            name: name.into(),
+            triggered,
+            severity,
+        });
+    };
+
     let has_category = |cat: &StringCategory| basic.strings.iter().any(|s| &s.category == cat);
     let has_non_normal = basic
         .strings
         .iter()
         .any(|s| !matches!(s.category, StringCategory::Normal));
 
-    // Helper: check if any imported function name matches (case-insensitive)
-    let has_api = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            pe.imports.iter().any(|dll| {
-                dll.functions.iter().any(|f| {
-                    let lower = f.name.to_lowercase();
-                    names.iter().any(|n| lower == n.to_lowercase())
-                })
-            })
-        } else {
-            false
-        }
-    };
+    let has_api = |names: &[&str]| has_imported_api(pe, elf, macho, names);
+    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, macho, names);
 
-    let has_all_apis = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            names.iter().all(|name| {
-                pe.imports.iter().any(|dll| {
-                    dll.functions
-                        .iter()
-                        .any(|f| f.name.eq_ignore_ascii_case(name))
-                })
-            })
-        } else {
-            false
-        }
-    };
+    // 1-9. Basic string & entropy checks
+    check("High entropy (>7.0)", basic.entropy > 7.0, DetectionSeverity::High);
+    check("Very high entropy (>7.5)", basic.entropy > 7.5, DetectionSeverity::High);
+    check("Packed binary", basic.is_packed, DetectionSeverity::High);
+    check("Suspicious strings found", has_non_normal, DetectionSeverity::Low);
+    check("URLs in strings", has_category(&StringCategory::Url), DetectionSeverity::Medium);
+    check("IP addresses in strings", has_category(&StringCategory::IpAddress), DetectionSeverity::Medium);
+    check("Commands in strings", has_category(&StringCategory::Command), DetectionSeverity::Medium);
+    check("Registry keys in strings", has_category(&StringCategory::RegistryKey), DetectionSeverity::Low);
+    check("Suspicious keywords", has_category(&StringCategory::Suspicious), DetectionSeverity::Low);
 
-    // 1. High entropy (>7.0)
-    checks.push(DetectionCheck {
-        name: "High entropy (>7.0)".into(),
-        triggered: basic.entropy > 7.0,
-        severity: DetectionSeverity::High,
-    });
-
-    // 2. Very high entropy (>7.5)
-    checks.push(DetectionCheck {
-        name: "Very high entropy (>7.5)".into(),
-        triggered: basic.entropy > 7.5,
-        severity: DetectionSeverity::High,
-    });
-
-    // 3. Packed binary
-    checks.push(DetectionCheck {
-        name: "Packed binary".into(),
-        triggered: basic.is_packed,
-        severity: DetectionSeverity::High,
-    });
-
-    // 4. Suspicious strings found
-    checks.push(DetectionCheck {
-        name: "Suspicious strings found".into(),
-        triggered: has_non_normal,
-        severity: DetectionSeverity::Low,
-    });
-
-    // 5. URLs in strings
-    checks.push(DetectionCheck {
-        name: "URLs in strings".into(),
-        triggered: has_category(&StringCategory::Url),
-        severity: DetectionSeverity::Medium,
-    });
-
-    // 6. IP addresses in strings
-    checks.push(DetectionCheck {
-        name: "IP addresses in strings".into(),
-        triggered: has_category(&StringCategory::IpAddress),
-        severity: DetectionSeverity::Medium,
-    });
-
-    // 7. Commands in strings
-    checks.push(DetectionCheck {
-        name: "Commands in strings".into(),
-        triggered: has_category(&StringCategory::Command),
-        severity: DetectionSeverity::Medium,
-    });
-
-    // 8. Registry keys in strings
-    checks.push(DetectionCheck {
-        name: "Registry keys in strings".into(),
-        triggered: has_category(&StringCategory::RegistryKey),
-        severity: DetectionSeverity::Low,
-    });
-
-    // 9. Suspicious keywords
-    checks.push(DetectionCheck {
-        name: "Suspicious keywords".into(),
-        triggered: has_category(&StringCategory::Suspicious),
-        severity: DetectionSeverity::Low,
-    });
-
-    // 10. Process injection APIs
+    // 10-14. API category checks
     let process_injection = has_all_apis(&[
         "VirtualAllocEx",
         "WriteProcessMemory",
         "CreateRemoteThread",
     ]);
-    checks.push(DetectionCheck {
-        name: "Process injection APIs".into(),
-        triggered: process_injection,
-        severity: DetectionSeverity::Critical,
-    });
+    check("Process injection APIs", process_injection, DetectionSeverity::Critical);
 
-    // 11. Anti-debug APIs
     let anti_debug = has_api(&[
         "IsDebuggerPresent",
         "CheckRemoteDebuggerPresent",
         "NtQueryInformationProcess",
         "OutputDebugStringA",
     ]);
-    checks.push(DetectionCheck {
-        name: "Anti-debug APIs".into(),
-        triggered: anti_debug,
-        severity: DetectionSeverity::High,
-    });
+    check("Anti-debug APIs", anti_debug, DetectionSeverity::High);
 
-    // 12. Network APIs
     let network_apis = has_api(&[
         "InternetOpenA",
         "InternetOpenW",
@@ -566,13 +539,8 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         "URLDownloadToFileA",
         "URLDownloadToFileW",
     ]);
-    checks.push(DetectionCheck {
-        name: "Network APIs".into(),
-        triggered: network_apis,
-        severity: DetectionSeverity::Medium,
-    });
+    check("Network APIs", network_apis, DetectionSeverity::Medium);
 
-    // 13. Crypto APIs
     let crypto_apis = has_api(&[
         "CryptEncrypt",
         "CryptDecrypt",
@@ -580,13 +548,8 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         "CryptAcquireContextW",
         "CryptGenKey",
     ]);
-    checks.push(DetectionCheck {
-        name: "Crypto APIs".into(),
-        triggered: crypto_apis,
-        severity: DetectionSeverity::Medium,
-    });
+    check("Crypto APIs", crypto_apis, DetectionSeverity::Medium);
 
-    // 14. Service manipulation APIs
     let service_apis = has_api(&[
         "CreateServiceA",
         "CreateServiceW",
@@ -597,127 +560,35 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
         "ChangeServiceConfigA",
         "ChangeServiceConfigW",
     ]);
-    checks.push(DetectionCheck {
-        name: "Service manipulation APIs".into(),
-        triggered: service_apis,
-        severity: DetectionSeverity::Low,
+    check("Service manipulation APIs", service_apis, DetectionSeverity::Low);
+
+    // 15-23. PE-specific checks
+    let wx_section = pe.as_ref().is_some_and(|p| p.sections.iter().any(|s| s.is_writable && s.is_executable));
+    let high_entropy_section = pe.as_ref().is_some_and(|p| p.sections.iter().any(|s| s.entropy > 7.0));
+    let suspicious_section_name = pe.as_ref().is_some_and(|p| {
+        let bad_names = [".upx", ".themida", ".vmp", ".aspack", ".nsp", ".enigma"];
+        p.sections.iter().any(|s| bad_names.iter().any(|b| s.name.to_lowercase().starts_with(b)))
     });
-
-    // PE-specific checks
-    let wx_section = pe
-        .as_ref()
-        .map(|p| p.sections.iter().any(|s| s.is_writable && s.is_executable))
-        .unwrap_or(false);
-
-    let high_entropy_section = pe
-        .as_ref()
-        .map(|p| p.sections.iter().any(|s| s.entropy > 7.0))
-        .unwrap_or(false);
-
-    let suspicious_section_name = pe
-        .as_ref()
-        .map(|p| {
-            let bad_names = [".upx", ".themida", ".vmp", ".aspack", ".nsp", ".enigma"];
-            p.sections
-                .iter()
-                .any(|s| bad_names.iter().any(|b| s.name.to_lowercase().starts_with(b)))
-        })
-        .unwrap_or(false);
-
-    let zeroed_timestamp = pe.as_ref().map(|p| p.timestamp == 0).unwrap_or(false);
-
-    let future_timestamp = pe
-        .as_ref()
-        .map(|p| p.timestamp_suspicious && p.timestamp > 0)
-        .unwrap_or(false);
-
-    let no_imports = pe
-        .as_ref()
-        .map(|p| p.imports.is_empty())
-        .unwrap_or(false);
-
-    let entry_point_anomaly = pe
-        .as_ref()
-        .map(|p| {
-            if let Some(first) = p.sections.first() {
-                let section_end = first.virtual_size;
-                p.entry_point > p.image_base + section_end
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false);
-
-    let packer_detected = pe
-        .as_ref()
-        .map(|p| p.packer_detected.is_some())
-        .unwrap_or(false);
-
-    // 15. W+X section
-    checks.push(DetectionCheck {
-        name: "W+X section".into(),
-        triggered: wx_section,
-        severity: DetectionSeverity::Critical,
+    let zeroed_timestamp = pe.as_ref().is_some_and(|p| p.timestamp == 0);
+    let future_timestamp = pe.as_ref().is_some_and(|p| p.timestamp_suspicious && p.timestamp > 0);
+    let no_imports = pe.as_ref().is_some_and(|p| p.imports.is_empty());
+    let entry_point_anomaly = pe.as_ref().is_some_and(|p| {
+        p.sections.first().is_some_and(|first| p.entry_point > p.image_base + first.virtual_size)
     });
+    let packer_detected = pe.as_ref().is_some_and(|p| p.packer_detected.is_some());
 
-    // 16. High entropy section
-    checks.push(DetectionCheck {
-        name: "High entropy section".into(),
-        triggered: high_entropy_section,
-        severity: DetectionSeverity::High,
-    });
+    check("W+X section", wx_section, DetectionSeverity::Critical);
+    check("High entropy section", high_entropy_section, DetectionSeverity::High);
+    check("Suspicious section name", suspicious_section_name, DetectionSeverity::High);
+    check("Zeroed timestamp", zeroed_timestamp, DetectionSeverity::Low);
+    check("Future timestamp", future_timestamp, DetectionSeverity::Low);
+    check("No imports", no_imports, DetectionSeverity::Info);
+    check("Entry point anomaly", entry_point_anomaly, DetectionSeverity::Low);
+    check("Known packer detected", packer_detected, DetectionSeverity::High);
+    check("File paths in strings", has_category(&StringCategory::FilePath), DetectionSeverity::Info);
 
-    // 17. Suspicious section name
-    checks.push(DetectionCheck {
-        name: "Suspicious section name".into(),
-        triggered: suspicious_section_name,
-        severity: DetectionSeverity::High,
-    });
-
-    // 18. Zeroed timestamp
-    checks.push(DetectionCheck {
-        name: "Zeroed timestamp".into(),
-        triggered: zeroed_timestamp,
-        severity: DetectionSeverity::Low,
-    });
-
-    // 19. Future timestamp
-    checks.push(DetectionCheck {
-        name: "Future timestamp".into(),
-        triggered: future_timestamp,
-        severity: DetectionSeverity::Low,
-    });
-
-    // 20. No imports
-    checks.push(DetectionCheck {
-        name: "No imports".into(),
-        triggered: no_imports,
-        severity: DetectionSeverity::Info,
-    });
-
-    // 21. Entry point anomaly
-    checks.push(DetectionCheck {
-        name: "Entry point anomaly".into(),
-        triggered: entry_point_anomaly,
-        severity: DetectionSeverity::Low,
-    });
-
-    // 22. Known packer detected
-    checks.push(DetectionCheck {
-        name: "Known packer detected".into(),
-        triggered: packer_detected,
-        severity: DetectionSeverity::High,
-    });
-
-    // 23. File paths in strings
-    checks.push(DetectionCheck {
-        name: "File paths in strings".into(),
-        triggered: has_category(&StringCategory::FilePath),
-        severity: DetectionSeverity::Info,
-    });
-
-    // 24. IAT Spoofing / Hidden IAT
-    let iat_spoofing = pe.as_ref().map(|p| {
+    // 24-34. Advanced PE checks
+    let iat_spoofing = pe.as_ref().is_some_and(|p| {
         let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
         let has_dyn_loading = p.imports.iter().any(|dll| {
             dll.functions.iter().any(|f| {
@@ -725,136 +596,74 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
                 name.contains("loadlibrary") || name.contains("getprocaddress") || name.contains("ldrloaddll") || name.contains("ldrgetprocedureaddress")
             })
         });
-        
-        let is_suspicious_no_imports = total_imports == 0 && file_size > 15360;
-        let is_suspicious_dyn_loading = total_imports > 0 && total_imports <= 5 && has_dyn_loading && file_size > 15360;
-        
-        is_suspicious_no_imports || is_suspicious_dyn_loading
-    }).unwrap_or(false);
-
-    checks.push(DetectionCheck {
-        name: "IAT Spoofing / Hidden IAT".into(),
-        triggered: iat_spoofing,
-        severity: DetectionSeverity::High,
+        (total_imports == 0 && file_size > 15360) || (total_imports > 0 && total_imports <= 5 && has_dyn_loading && file_size > 15360)
     });
+    check("IAT Spoofing / Hidden IAT", iat_spoofing, DetectionSeverity::High);
+    check("PEB Walking (API Hashing)", pe.as_ref().is_some_and(|p| p.peb_walking), DetectionSeverity::High);
+    check("API Hashing loop detected", pe.as_ref().is_some_and(|p| p.api_hashing), DetectionSeverity::High);
+    check("Selective API Obfuscation", pe.as_ref().is_some_and(|p| !p.obfuscated_apis.is_empty()), DetectionSeverity::High);
+    check("PDB path found", pe.as_ref().is_some_and(|p| p.pdb_path.is_some()), DetectionSeverity::Info);
 
-    // 25. PEB Walking (API Hashing)
-    let peb_walking = pe.as_ref().map(|p| p.peb_walking).unwrap_or(false);
-
-    checks.push(DetectionCheck {
-        name: "PEB Walking (API Hashing)".into(),
-        triggered: peb_walking,
-        severity: DetectionSeverity::High,
-    });
-
-    // API Hashing loop detected
-    let api_hashing = pe.as_ref().map(|p| p.api_hashing).unwrap_or(false);
-
-    checks.push(DetectionCheck {
-        name: "API Hashing loop detected".into(),
-        triggered: api_hashing,
-        severity: DetectionSeverity::High,
-    });
-
-    // 26. Selective API Obfuscation
-    let selective_api_obfuscation = pe.as_ref().map(|p| {
-        let has_dyn_loading = p.imports.iter().any(|dll| {
-            dll.functions.iter().any(|f| {
-                let name = f.name.to_lowercase();
-                name.contains("loadlibrary") || name.contains("getprocaddress") || name.contains("ldrloaddll")
-            })
-        });
-
-        if !has_dyn_loading && !peb_walking {
-            return false;
-        }
-
-        let sensitive_apis = [
-            "VirtualAllocEx", "VirtualProtectEx", "WriteProcessMemory", "CreateRemoteThread",
-            "NtCreateThreadEx", "RtlCreateUserThread", "QueueUserAPC", "SetThreadContext",
-            "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess"
-        ];
-
-        let imported_apis: std::collections::HashSet<String> = p.imports.iter()
-            .flat_map(|dll| dll.functions.iter().map(|f| f.name.to_lowercase()))
-            .collect();
-
-        sensitive_apis.iter().any(|&api| {
-            let api_lower = api.to_lowercase();
-            if imported_apis.contains(&api_lower) {
-                return false;
-            }
-            basic.strings.iter().any(|s| {
-                s.value.to_lowercase().contains(&api_lower) || 
-                s.decoded.as_ref().map_or(false, |d| d.to_lowercase().contains(&api_lower))
-            })
-        })
-    }).unwrap_or(false);
-
-    checks.push(DetectionCheck {
-        name: "Selective API Obfuscation".into(),
-        triggered: selective_api_obfuscation,
-        severity: DetectionSeverity::High,
-    });
-
-    let has_pdb = pe.as_ref().map(|p| p.pdb_path.is_some()).unwrap_or(false);
-    checks.push(DetectionCheck {
-        name: "PDB path found".into(),
-        triggered: has_pdb,
-        severity: DetectionSeverity::Info,
-    });
-
-    let pdb_suspicious = pe.as_ref().map(|p| {
-        if let Some(ref path) = p.pdb_path {
+    let pdb_suspicious = pe.as_ref().is_some_and(|p| {
+        p.pdb_path.as_ref().is_some_and(|path| {
             let path_lower = path.to_lowercase();
             ["malware", "trojan", "exploit", "hack", "stealer", "bypass", "inject"].iter().any(|&k| path_lower.contains(k))
-        } else {
-            false
-        }
-    }).unwrap_or(false);
-
-    checks.push(DetectionCheck {
-        name: "Suspicious PDB path".into(),
-        triggered: pdb_suspicious,
-        severity: DetectionSeverity::High,
+        })
     });
+    check("Suspicious PDB path", pdb_suspicious, DetectionSeverity::High);
 
-    let (manifest_admin, manifest_autoelevate) = pe.as_ref().map(|p| {
-        if let Some(ref m) = p.manifest {
-            let m_lower = m.to_lowercase();
-            let admin = m_lower.contains("requireadministrator");
-            let autoelevate = m_lower.contains("autoelevate") && m_lower.contains("true");
-            (admin, autoelevate)
-        } else {
-            (false, false)
-        }
+    let (manifest_admin, manifest_autoelevate) = pe.as_ref().and_then(|p| {
+        let m = p.manifest.as_deref()?.to_lowercase();
+        let admin = m.contains("requireadministrator");
+        let autoelevate = m.contains("autoelevate") && m.contains("true");
+        Some((admin, autoelevate))
     }).unwrap_or((false, false));
 
-    checks.push(DetectionCheck {
-        name: "Admin privileges requested (Manifest)".into(),
-        triggered: manifest_admin,
-        severity: DetectionSeverity::Medium,
-    });
+    check("Admin privileges requested (Manifest)", manifest_admin, DetectionSeverity::Medium);
+    check("UAC AutoElevate requested (Manifest)", manifest_autoelevate, DetectionSeverity::High);
+    check("Direct Syscalls Detected", pe.as_ref().is_some_and(|p| p.direct_syscalls), DetectionSeverity::Critical);
+    check("Indirect Syscalls Detected", pe.as_ref().is_some_and(|p| p.indirect_syscalls), DetectionSeverity::Critical);
 
-    checks.push(DetectionCheck {
-        name: "UAC AutoElevate requested (Manifest)".into(),
-        triggered: manifest_autoelevate,
-        severity: DetectionSeverity::High,
+    let stealth_c2 = pe.as_ref().is_some_and(|p| {
+        let has_evasive_calls = p.api_hashing || p.peb_walking || p.direct_syscalls || p.indirect_syscalls;
+        let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
+        has_evasive_calls && (total_imports <= 35 || p.imports.len() <= 3)
     });
+    check("Stealth C2 Agent Profile (Evasive Loading + Sparse IAT)", stealth_c2, DetectionSeverity::Critical);
 
-    let direct_sys = pe.as_ref().map(|p| p.direct_syscalls).unwrap_or(false);
-    checks.push(DetectionCheck {
-        name: "Direct Syscalls Detected".into(),
-        triggered: direct_sys,
-        severity: DetectionSeverity::Critical,
+    let self_signed_cert = pe.as_ref().is_some_and(|p| {
+        p.certificate.as_ref().is_some_and(|c| c.is_self_signed)
     });
+    check("Self-signed Authenticode Certificate", self_signed_cert, DetectionSeverity::Critical);
+    check("1-byte XOR Encrypted Payload", pe.as_ref().is_some_and(|p| !p.xor_payloads.is_empty()), DetectionSeverity::Critical);
 
-    let indirect_sys = pe.as_ref().map(|p| p.indirect_syscalls).unwrap_or(false);
-    checks.push(DetectionCheck {
-        name: "Indirect Syscalls Detected".into(),
-        triggered: indirect_sys,
-        severity: DetectionSeverity::Critical,
-    });
+    // ─── ELF-Specific Detection Checks ───
+    if let Some(elf) = elf {
+        let has_wx_ph = elf.program_headers.iter().any(|ph| ph.is_write && ph.is_exec);
+        let has_wx_sh = elf.sections.iter().any(|s| s.is_writable && s.is_executable);
+        check("W+X Segment / Section (ELF)", has_wx_ph || has_wx_sh, DetectionSeverity::Critical);
+        check("Executable Stack (NX Disabled)", !elf.mitigations.nx, DetectionSeverity::High);
+
+        let fileless_exec = has_api(&["memfd_create"]) && (has_api(&["fexecve", "execveat"]) || has_category(&StringCategory::Command));
+        check("Fileless execution (memfd_create)", fileless_exec, DetectionSeverity::Critical);
+
+        let linux_injection = has_api(&["ptrace", "process_vm_writev"]);
+        check("Linux process injection (ptrace)", linux_injection, DetectionSeverity::Critical);
+        check("Direct Syscalls (ELF)", elf.direct_syscalls, DetectionSeverity::Critical);
+        check("Kernel module manipulation", has_api(&["init_module", "finit_module", "delete_module", "kexec_load"]), DetectionSeverity::Critical);
+        check("Known packer detected", elf.packer_detected.is_some(), DetectionSeverity::High);
+    }
+
+    // ─── Mach-O-Specific Detection Checks ───
+    if let Some(macho) = macho {
+        let has_wx_seg = macho.segments.iter().any(|s| s.is_write && s.is_exec && s.filesize > 0);
+        let has_wx_sec = macho.sections.iter().any(|s| s.is_writable && s.is_executable);
+        check("W+X Segment / Section (Mach-O)", has_wx_seg || has_wx_sec, DetectionSeverity::Critical);
+        check("Executable Stack (Mach-O)", macho.mitigations.allow_stack_execution, DetectionSeverity::Critical);
+        check("Direct Syscalls (Mach-O)", macho.direct_syscalls, DetectionSeverity::Critical);
+        check("Task Port Tampering / Injection (macOS)", has_api(&["task_for_pid", "mach_vm_write", "mach_vm_protect", "thread_create_running"]), DetectionSeverity::Critical);
+        check("Unsigned Mach-O Binary", !macho.has_code_signature, DetectionSeverity::Medium);
+    }
 
     checks
 }
@@ -864,35 +673,11 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, file_s
 fn detect_malware_pattern(
     basic: &BasicAnalysis,
     pe: &Option<PeAnalysis>,
+    elf: &Option<ElfAnalysis>,
+    macho: &Option<MachoAnalysis>,
 ) -> Option<MalwarePattern> {
-    // Helper closures
-    let has_api = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            pe.imports.iter().any(|dll| {
-                dll.functions.iter().any(|f| {
-                    names
-                        .iter()
-                        .any(|n| f.name.eq_ignore_ascii_case(n))
-                })
-            })
-        } else {
-            false
-        }
-    };
-
-    let has_all_apis = |names: &[&str]| -> bool {
-        if let Some(pe) = pe {
-            names.iter().all(|name| {
-                pe.imports.iter().any(|dll| {
-                    dll.functions
-                        .iter()
-                        .any(|f| f.name.eq_ignore_ascii_case(name))
-                })
-            })
-        } else {
-            false
-        }
-    };
+    let has_api = |names: &[&str]| has_imported_api(pe, elf, macho, names);
+    let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, macho, names);
 
     let has_category = |cat: &StringCategory| basic.strings.iter().any(|s| &s.category == cat);
 
@@ -913,13 +698,20 @@ fn detect_malware_pattern(
         "HttpOpenRequestW",
         "URLDownloadToFileA",
         "URLDownloadToFileW",
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "sendto",
+        "recvfrom",
     ]);
 
     let process_injection = has_all_apis(&[
         "VirtualAllocEx",
         "WriteProcessMemory",
         "CreateRemoteThread",
-    ]);
+    ]) || has_api(&["ptrace", "process_vm_writev"]);
 
     let crypto_apis = has_api(&[
         "CryptEncrypt",
@@ -932,6 +724,7 @@ fn detect_malware_pattern(
         "IsDebuggerPresent",
         "CheckRemoteDebuggerPresent",
         "NtQueryInformationProcess",
+        "ptrace",
     ]);
 
     let service_apis = has_api(&[
@@ -941,6 +734,94 @@ fn detect_malware_pattern(
         "OpenServiceW",
     ]);
 
+    // ─── Linux-specific Malware Patterns ───
+    if let Some(elf_info) = elf {
+        // Linux.Rootkit
+        let rootkit_apis = has_api(&["init_module", "finit_module", "kexec_load", "bpf"]);
+        let preload_strings = has_string_containing(&["ld.so.preload", "/etc/ld.so.preload"]);
+        if rootkit_apis || preload_strings {
+            return Some(MalwarePattern {
+                family: "Rootkit.Linux".into(),
+                confidence: "High".into(),
+                description: "Kernel module loading or dynamic linker preload hijacking detected".into(),
+                matched_indicators: vec![
+                    if rootkit_apis { "Kernel module API (init_module/kexec/bpf)".into() } else { "ld.so.preload path reference".into() },
+                ],
+            });
+        }
+
+        // Linux.FilelessDropper
+        if has_api(&["memfd_create"]) && (has_api(&["fexecve", "execveat", "execve"]) || network_apis) {
+            return Some(MalwarePattern {
+                family: "Dropper.Fileless.Linux".into(),
+                confidence: "High".into(),
+                description: "In-memory fileless binary execution via memfd_create and fexecve".into(),
+                matched_indicators: vec![
+                    "memfd_create API import".into(),
+                    "Execution/Network primitives".into(),
+                ],
+            });
+        }
+
+        // Linux.Botnet (Mirai / Gafgyt / Tsunami family)
+        let botnet_strings = has_string_containing(&["/bin/busybox", "telnet", "wget", "tftp", "iptables -F", "/proc/net/tcp"]);
+        let is_embedded_arch = elf_info.machine == "ARM" || elf_info.machine == "MIPS" || elf_info.machine == "RISC-V";
+        if network_apis && (botnet_strings || is_embedded_arch) {
+            return Some(MalwarePattern {
+                family: "Botnet.IoT.Linux".into(),
+                confidence: if botnet_strings && is_embedded_arch { "High" } else { "Medium" }.into(),
+                description: "IoT/Linux botnet signatures (network primitives, busybox/telnet payload strings or embedded architecture)".into(),
+                matched_indicators: vec![
+                    "Network socket APIs".into(),
+                    format!("Architecture: {}", elf_info.machine),
+                ],
+            });
+        }
+    }
+
+    // ─── macOS-specific Malware Patterns ───
+    if let Some(_macho_info) = macho {
+        // macOS.Spyware
+        let spy_apis = has_api(&["CGEventTapCreate", "IOHIDManagerOpen", "CGWindowListCreateImage"]);
+        if spy_apis {
+            return Some(MalwarePattern {
+                family: "Spyware.macOS".into(),
+                confidence: "High".into(),
+                description: "Input event tapping or screen capture activity detected".into(),
+                matched_indicators: vec![
+                    "EventTap or Screen Capture API (CGEventTapCreate/CGWindowListCreateImage)".into(),
+                ],
+            });
+        }
+
+        // macOS.Stealer
+        let stealer_apis = has_api(&["SecKeychainItemCopyAttributesAndData", "SecItemCopyMatching"]);
+        let stealer_strings = has_string_containing(&["keychain", "cookies.binarycookies", "tcc.db"]);
+        if stealer_apis || stealer_strings {
+            return Some(MalwarePattern {
+                family: "Stealer.macOS".into(),
+                confidence: "High".into(),
+                description: "Keychain, credential database, or TCC database access detected".into(),
+                matched_indicators: vec![
+                    if stealer_apis { "Keychain access API".into() } else { "macOS sensitive file path in strings".into() },
+                ],
+            });
+        }
+
+        // macOS.Injector
+        let inject_apis = has_api(&["task_for_pid", "mach_vm_write", "NSCreateObjectFileImageFromMemory"]);
+        if inject_apis {
+            return Some(MalwarePattern {
+                family: "Injector.macOS".into(),
+                confidence: "High".into(),
+                description: "Mach task port manipulation or in-memory bundle loading detected".into(),
+                matched_indicators: vec![
+                    "Mach task or bundle API (task_for_pid/NSCreateObjectFileImageFromMemory)".into(),
+                ],
+            });
+        }
+    }
+
     // 1. Trojan.Injector — process injection + network (High)
     if process_injection && network_apis {
         return Some(MalwarePattern {
@@ -949,7 +830,7 @@ fn detect_malware_pattern(
             description: "Process injection combined with network communication capabilities"
                 .into(),
             matched_indicators: vec![
-                "VirtualAllocEx + WriteProcessMemory + CreateRemoteThread".into(),
+                "Process injection APIs (VirtualAllocEx / ptrace)".into(),
                 "Network API imports".into(),
             ],
         });
@@ -1036,6 +917,34 @@ fn detect_malware_pattern(
         });
     }
 
+    // 7. Trojan.C2Agent — API hashing / dynamic resolution with hidden/sparse imports (High)
+    if let Some(pe) = pe {
+        let total_imports: usize = pe.imports.iter().map(|dll| dll.functions.len()).sum();
+        let is_sparse_imports = total_imports <= 35 || pe.imports.len() <= 3;
+        let has_stealth_loading = pe.api_hashing || pe.peb_walking || pe.direct_syscalls || pe.indirect_syscalls;
+
+        if has_stealth_loading && is_sparse_imports {
+            let mut indicators = Vec::new();
+            if pe.api_hashing {
+                indicators.push("API Hashing loop detected (dynamic export resolution)".into());
+            }
+            if pe.peb_walking {
+                indicators.push("PEB Walking detected (FS/GS segment access)".into());
+            }
+            if pe.direct_syscalls || pe.indirect_syscalls {
+                indicators.push("Custom Syscall stubs detected".into());
+            }
+            indicators.push(format!("Sparse/hidden import table ({} imported APIs across {} DLLs)", total_imports, pe.imports.len()));
+
+            return Some(MalwarePattern {
+                family: "Trojan.C2Agent".into(),
+                confidence: "High".into(),
+                description: "Stealth implant / C2 agent utilizing API hashing or evasive system calls with minimal import table footprint".into(),
+                matched_indicators: indicators,
+            });
+        }
+    }
+
     None
 }
 
@@ -1053,9 +962,7 @@ fn yara_severity(rule_name: &str) -> DetectionSeverity {
     }
 }
 
-pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
-    pe::find_embedded_pe(data, parent_is_pe)
-}
+pub use pe::find_embedded_pe;
 
 pub fn resolve_syscall_name(ssn: u32) -> &'static str {
     match ssn {
@@ -1166,39 +1073,70 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
         let mnemonic = instr.mnemonic();
 
         // Check for Indirect Syscalls
-        if mnemonic == Mnemonic::Jmp || mnemonic == Mnemonic::Call {
+        // Valid indirect syscall pattern:
+        // 1. mov r10, rcx (fastcall conversion) within close proximity (<= 6 instrs)
+        // 2. mov eax/rax, <SSN> (0 < SSN < 0x300)
+        // 3. jmp reg (NOT call, to maintain kernel return stack alignment)
+        if mnemonic == Mnemonic::Jmp {
             let op0 = instr.op0_kind();
             if op0 == OpKind::Register {
                 let reg = instr.op0_register();
-                if reg != Register::RSP && reg != Register::RBP && reg != Register::ESP && reg != Register::EBP {
-                    let start_check = idx.saturating_sub(15);
-                    for prev_instr in &instructions[start_check..idx] {
+                if reg != Register::RSP && reg != Register::RBP && reg != Register::ESP && reg != Register::EBP && reg != Register::RIP {
+                    let start_check = idx.saturating_sub(6);
+                    let preceding = &instructions[start_check..idx];
+
+                    let mut found_r10_rcx = false;
+                    let mut found_ssn: Option<(u32, &iced_x86::Instruction)> = None;
+
+                    for prev_instr in preceding {
                         let prev_mn = prev_instr.mnemonic();
-                        if prev_mn == Mnemonic::Mov {
-                            if prev_instr.op0_kind() == OpKind::Register {
-                                let dest_reg = prev_instr.op0_register();
-                                if dest_reg == Register::EAX || dest_reg == Register::RAX {
-                                    let op1 = prev_instr.op1_kind();
-                                    if op1 == OpKind::Immediate8 || op1 == OpKind::Immediate8to32 || op1 == OpKind::Immediate8to64 || op1 == OpKind::Immediate32 || op1 == OpKind::Immediate32to64 || op1 == OpKind::Immediate64 {
-                                        let imm = prev_instr.immediate32();
-                                        if imm > 0 && imm < 600 {
-                                            indirect_syscalls = true;
 
-                                            let mut mov_str = String::new();
-                                            formatter.format(prev_instr, &mut mov_str);
-                                            let mut jmp_str = String::new();
-                                            formatter.format(instr, &mut jmp_str);
+                        // Check `mov r10, rcx` or `mov r10d, ecx`
+                        if prev_mn == Mnemonic::Mov
+                            && prev_instr.op0_kind() == OpKind::Register
+                            && (prev_instr.op0_register() == Register::R10 || prev_instr.op0_register() == Register::R10D)
+                            && prev_instr.op1_kind() == OpKind::Register
+                            && (prev_instr.op1_register() == Register::RCX || prev_instr.op1_register() == Register::ECX)
+                        {
+                            found_r10_rcx = true;
+                        }
 
-                                            syscall_locations.push(SyscallLocation {
-                                                address: instr.ip(),
-                                                is_indirect: true,
-                                                instruction_str: format!("{}; {} ({})", mov_str, jmp_str, resolve_syscall_name(imm)),
-                                            });
-                                            break;
-                                        }
+                        // Check `mov eax/rax, <SSN>`
+                        if prev_mn == Mnemonic::Mov
+                            && prev_instr.op0_kind() == OpKind::Register
+                        {
+                            let dest_reg = prev_instr.op0_register();
+                            if dest_reg == Register::EAX || dest_reg == Register::RAX {
+                                let op1 = prev_instr.op1_kind();
+                                if matches!(
+                                    op1,
+                                    OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64
+                                        | OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate64
+                                ) {
+                                    let imm = prev_instr.immediate32();
+                                    if imm > 0 && imm < 0x400 {
+                                        found_ssn = Some((imm, prev_instr));
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Strict criteria: requires SSN load AND r10<-rcx setup in same stub
+                    if let Some((ssn, ssn_instr)) = found_ssn {
+                        if found_r10_rcx {
+                            indirect_syscalls = true;
+
+                            let mut mov_str = String::new();
+                            formatter.format(ssn_instr, &mut mov_str);
+                            let mut jmp_str = String::new();
+                            formatter.format(instr, &mut jmp_str);
+
+                            syscall_locations.push(SyscallLocation {
+                                address: instr.ip(),
+                                is_indirect: true,
+                                instruction_str: format!("{}; {} ({})", mov_str, jmp_str, resolve_syscall_name(ssn)),
+                            });
                         }
                     }
                 }
@@ -1310,8 +1248,9 @@ mod tests {
 
         // Indirect Syscall test
         let indirect_code = [
+            0x4C, 0x8B, 0xD1,             // mov r10, rcx
             0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
-            0x41, 0xFF, 0xE3              // jmp r11
+            0x41, 0xFF, 0xE3,             // jmp r11
         ];
         let (_, _, direct, indirect, locations) = scan_peb_and_hashing(64, &indirect_code, 0x1000);
         assert!(!direct);
