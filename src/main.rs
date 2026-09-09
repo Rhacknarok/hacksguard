@@ -4,7 +4,7 @@ mod analysis;
 mod app;
 mod models;
 mod theme;
-mod tui;
+mod ui;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     let mut tasks_done = 0;
 
     let result = loop {
-        while let Ok(_) = prog_rx.try_recv() {
+        while prog_rx.try_recv().is_ok() {
             tasks_done += 1;
         }
 

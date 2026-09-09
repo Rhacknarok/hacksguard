@@ -1,4 +1,4 @@
-use crate::tui::ui;
+use crate::ui;
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
@@ -162,7 +162,7 @@ impl App {
                             self.copy_to_clipboard();
                         }
                         KeyCode::Char('e') => {
-                            if self.result.pe.as_ref().map_or(false, |pe| pe.embedded_pe.is_some()) {
+                            if self.result.pe.as_ref().is_some_and(|pe| pe.embedded_pe.is_some()) {
                                 self.inspect_embedded = !self.inspect_embedded;
                                 self.rebuild_tabs();
                                 self.current_tab = 0; // go to Overview on toggle
@@ -223,13 +223,7 @@ impl App {
             if pe.manifest.is_some() {
                 tab_names.push("Manifest".into());
             }
-        } else if self.result.elf.is_some() {
-            tab_names.push("Headers".into());
-            tab_names.push("Segments".into());
-            tab_names.push("Sections".into());
-            tab_names.push("Imports".into());
-            tab_names.push("Disasm".into());
-        } else if self.result.macho.is_some() {
+        } else if self.result.elf.is_some() || self.result.macho.is_some() {
             tab_names.push("Headers".into());
             tab_names.push("Segments".into());
             tab_names.push("Sections".into());
@@ -246,7 +240,7 @@ impl App {
     pub fn current_pe(&self) -> Option<&crate::models::PeAnalysis> {
         let parent = self.result.pe.as_ref();
         if self.inspect_embedded {
-            parent.and_then(|pe| pe.embedded_pe.as_ref().map(|b| &**b))
+            parent.and_then(|pe| pe.embedded_pe.as_deref())
         } else {
             parent
         }
@@ -276,7 +270,7 @@ impl App {
                     }
                     if !query.is_empty() {
                         let match_val = s.value.to_lowercase().contains(&query);
-                        let match_dec = s.decoded.as_ref().map_or(false, |d| d.to_lowercase().contains(&query));
+                        let match_dec = s.decoded.as_ref().is_some_and(|d| d.to_lowercase().contains(&query));
                         if !match_val && !match_dec {
                             return false;
                         }
