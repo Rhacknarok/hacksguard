@@ -5,7 +5,6 @@ pub mod macho;
 pub mod authenticode;
 
 use crate::models::*;
-use color_eyre::Result;
 use std::path::Path;
 
 /// Run the full analysis pipeline on a file.

@@ -1,6 +1,5 @@
 use crate::analysis::basic::shannon_entropy;
 use crate::models::*;
-use color_eyre::Result;
 use goblin::Object;
 use md5::{Digest, Md5};
 use std::collections::BTreeMap;
@@ -10,7 +9,7 @@ use std::time::SystemTime;
 pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
     let pe = match Object::parse(data)? {
         Object::PE(pe) => pe,
-        _ => color_eyre::eyre::bail!("Not a PE file"),
+        _ => return Err("Not a PE file".into()),
     };
 
     let coff = &pe.header.coff_header;

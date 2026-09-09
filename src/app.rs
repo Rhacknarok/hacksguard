@@ -1,10 +1,9 @@
+use crate::models::{AnalysisResult, Result};
 use crate::ui;
-use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
 use std::time::Duration;
 
-use crate::models::AnalysisResult;
 
 pub struct App {
     pub result: AnalysisResult,

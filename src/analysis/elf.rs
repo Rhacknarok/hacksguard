@@ -1,6 +1,5 @@
 use crate::analysis::basic::shannon_entropy;
 use crate::models::*;
-use color_eyre::Result;
 use goblin::elf::header::*;
 use goblin::elf::program_header::*;
 use goblin::elf::section_header::*;
@@ -10,7 +9,7 @@ use goblin::Object;
 pub fn analyze(data: &[u8]) -> Result<ElfAnalysis> {
     let elf = match Object::parse(data)? {
         Object::Elf(elf) => elf,
-        _ => color_eyre::eyre::bail!("Not an ELF file"),
+        _ => return Err("Not an ELF file".into()),
     };
 
     let machine = match elf.header.e_machine {

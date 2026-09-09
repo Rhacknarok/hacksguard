@@ -1,6 +1,5 @@
 use crate::analysis::basic::shannon_entropy;
 use crate::models::*;
-use color_eyre::Result;
 use goblin::mach::{constants::cputype, header, load_command::CommandVariant, Mach, MachO, SingleArch};
 
 /// Analyze Mach-O binary (single architecture or Fat container).
@@ -31,7 +30,7 @@ pub fn analyze(data: &[u8]) -> Result<MachoAnalysis> {
 
             match fat.get(best_idx)? {
                 SingleArch::MachO(macho) => analyze_single(&macho, best_slice),
-                _ => color_eyre::eyre::bail!("Selected fat entry is not a Mach-O binary"),
+                _ => return Err("Selected fat entry is not a Mach-O binary".into()),
             }
         }
     }

@@ -11,7 +11,7 @@ mod ui;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::Parser;
-use color_eyre::Result;
+use crate::models::Result;
 use std::path::PathBuf;
 
 /// HACKSGUARD — TUI malware analysis tool
@@ -26,7 +26,6 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    color_eyre::install()?;
     let cli = Cli::parse();
 
     if !cli.file.exists() {
