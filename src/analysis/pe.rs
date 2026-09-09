@@ -30,7 +30,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
 
     let (entry_point, image_base, subsystem, linker_version) =
         if let Some(opt) = pe.header.optional_header {
-            let ep = opt.standard_fields.address_of_entry_point as u64;
+            let ep = opt.standard_fields.address_of_entry_point;
             let ib = opt.windows_fields.image_base;
             let ss = match opt.windows_fields.subsystem {
                 1 => "Native",
@@ -944,24 +944,11 @@ pub fn scan_xor_payloads(data: &[u8], base_offset: usize, location: &str) -> Vec
 }
 
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    if offset + 2 <= data.len() {
-        Some(u16::from_le_bytes([data[offset], data[offset + 1]]))
-    } else {
-        None
-    }
+    data.get(offset..offset + 2)?.try_into().ok().map(u16::from_le_bytes)
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    if offset + 4 <= data.len() {
-        Some(u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]))
-    } else {
-        None
-    }
+    data.get(offset..offset + 4)?.try_into().ok().map(u32::from_le_bytes)
 }
 
 fn iter_rsrc_entries(rsrc: &[u8], dir_offset: usize) -> impl Iterator<Item = (u32, u32)> + '_ {

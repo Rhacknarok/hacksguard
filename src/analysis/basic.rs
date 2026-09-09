@@ -3,27 +3,22 @@ use sha2::{Digest, Sha256};
 
 /// Run basic (format-agnostic) analysis: hashes, entropy, strings.
 pub fn analyze(data: &[u8]) -> BasicAnalysis {
-    let (((md5, sha1), (sha256, entropy)), (strings, byte_distribution)) = rayon::join(
+    let ((md5, sha1), (sha256, (strings, (byte_distribution, entropy)))) = rayon::join(
         || rayon::join(
-            || rayon::join(
-                || compute_hash::<md5::Md5>(data),
-                || compute_hash::<sha1::Sha1>(data),
-            ),
-            || rayon::join(
-                || compute_hash::<Sha256>(data),
-                || shannon_entropy(data),
-            )
+            || compute_hash::<md5::Md5>(data),
+            || compute_hash::<sha1::Sha1>(data),
         ),
         || rayon::join(
-            || extract_strings(data, 4),
-            || {
-                let mut dist = [0u64; 256];
-                for &b in data {
-                    dist[b as usize] += 1;
-                }
-                dist.to_vec()
-            }
-        )
+            || compute_hash::<Sha256>(data),
+            || rayon::join(
+                || extract_strings(data, 4),
+                || {
+                    let freq = byte_frequencies(data);
+                    let ent = entropy_from_frequencies(&freq, data.len());
+                    (freq.to_vec(), ent)
+                },
+            ),
+        ),
     );
 
     let is_packed = entropy > 7.0;
@@ -50,15 +45,19 @@ fn compute_hash<D: Digest>(data: &[u8]) -> String {
 
 // ─── Entropy ─────────────────────────────────────────────────────
 
-pub fn shannon_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
+pub fn byte_frequencies(data: &[u8]) -> [u64; 256] {
     let mut freq = [0u64; 256];
     for &b in data {
         freq[b as usize] += 1;
     }
-    let len = data.len() as f64;
+    freq
+}
+
+pub fn entropy_from_frequencies(freq: &[u64; 256], total_len: usize) -> f64 {
+    if total_len == 0 {
+        return 0.0;
+    }
+    let len = total_len as f64;
     freq.iter()
         .filter(|&&c| c > 0)
         .map(|&c| {
@@ -66,6 +65,10 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
             -p * p.log2()
         })
         .sum()
+}
+
+pub fn shannon_entropy(data: &[u8]) -> f64 {
+    entropy_from_frequencies(&byte_frequencies(data), data.len())
 }
 
 // ─── String extraction ───────────────────────────────────────────
@@ -106,17 +109,13 @@ fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
             current.push(b);
         } else {
             if current.len() >= min_len {
-                for off in start_offset..start_offset + current.len() {
-                    ascii_occupied[off] = true;
-                }
+                ascii_occupied[start_offset..start_offset + current.len()].fill(true);
             }
             push_entry(&mut current, start_offset, false);
         }
     }
     if current.len() >= min_len {
-        for off in start_offset..start_offset + current.len() {
-            ascii_occupied[off] = true;
-        }
+        ascii_occupied[start_offset..start_offset + current.len()].fill(true);
     }
     push_entry(&mut current, start_offset, false);
 
@@ -165,7 +164,7 @@ fn is_base64_like(s: &str) -> bool {
             return false;
         }
     }
-    s.len() % 4 == 0
+    s.len().is_multiple_of(4)
 }
 
 fn categorize_string(s: &str) -> StringCategory {
