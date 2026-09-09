@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-09
+
 ### Added
 - **Authenticode DER Certificate Decoding (X.509 & PKCS#7)**:
   - Implemented zero-dependency ASN.1 DER and PKCS#7 `SignedData` parser (`src/analysis/authenticode.rs`) decoding leaf X.509 certificates from the PE Security Directory (`IMAGE_DIRECTORY_ENTRY_SECURITY`).
@@ -59,10 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added dynamic TUI tabs for ELF binaries (`Headers`, `Segments`, `Sections`, `Imports`, `Disasm`) and integrated metadata into the Overview dashboard.
 
 ### Changed
-- **Architecture & Complexity Refactor (Ponytail Audit)**:
-  - Deduplicated analysis pipeline: unified risk breakdown calculation and removed redundant API obfuscation scanning loops.
-  - Unified PE and ELF disassembly rendering logic into a single shared helper (`render_disasm`).
-  - Simplified TUI initialization and restoration to native standard `ratatui::init` / `ratatui::restore`.
+- **Dependency Elimination**:
+  - Removed `color-eyre = "0.6"` and ~15 transitive crates (`eyre`, `indenter`, `owo-colors`, `tracing-error`, etc.) in favor of standard library `std::error::Error`.
+- **Codebase Simplification & Performance (Ponytail Audit)**:
+  - Deduplicated detection check construction (simplified 40+ verbose instantiations via helper) and unified scoring loops for `ApiRisk` and `Anomaly` across PE, ELF, and Mach-O formats (-330 LOC).
+  - Replaced multiple passes over file bytes with single-pass byte frequency distribution, deriving Shannon entropy directly from frequency tables.
+  - Flattened TUI module layout (`src/tui/ui.rs` moved to `src/ui.rs`, removed redundant `src/tui/mod.rs`).
+  - Unified PE, ELF, and Mach-O disassembly rendering into a single shared helper (`draw_binary_disasm`).
+  - Merged duplicate ELF/Mach-O tab dispatch branches in `src/app.rs`.
+  - Simplified TUI initialization and restoration to standard `ratatui::init` / `ratatui::restore`.
+  - Replaced custom endian reading functions with native stdlib slice conversions (`try_into`).
 
 ### Fixed
 - **Cross-Platform YARA Cache & Path Resolution**: Fixed `.yara_cache` loading failures on non-Windows platforms:
