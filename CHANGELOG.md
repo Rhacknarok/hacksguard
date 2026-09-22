@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Relicensed to PolyForm Noncommercial License 1.0.0**:
+  - Relicensed Hacksguard core engine from MIT to PolyForm Noncommercial 1.0.0 (`PolyForm-Noncommercial-1.0.0`), prohibiting commercial exploitation, paid service wrapping, and proprietary product integration while preserving free access for personal, academic, research, and open-source purposes.
+  - Documented third-party submodule licensing compliance in [`LICENSE.md`](LICENSE.md) and [`README.md`](README.md) (`rules/elastic` under Elastic License 2.0, `rules/signature-base` under DRL 1.1).
+
 ## [0.4.0] - 2026-09-09
 
 ### Added

@@ -1,7 +1,7 @@
 # Hacksguard 0.4 - Blazing Fast TUI Malware Analysis Tool 🛡️
 
 ![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust)
-![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+![License](https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0-red?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-lightgrey?style=flat-square)
 
 ![Hacksguard TUI Malware Analysis Dashboard](assets/hacksguard.gif)
@@ -117,3 +117,15 @@ cargo run --release -- <path/to/binary.exe>
 
 ### Analyst Guide
 ![Analyst Guide](assets/screenshots/9%20-%20guide.png)
+
+## 📄 License
+
+This software is licensed under the **PolyForm Noncommercial License 1.0.0** ([LICENSE.md](LICENSE.md)).
+
+- **Permitted**: Free use for personal projects, academic research, education, and open-source development.
+- **Prohibited**: Commercial use (paid SOC/incident response services, integration into commercial/proprietary security products, or financial advantage) without prior authorization.
+
+### Third-Party Submodules & Rules
+- `rules/elastic`: [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license) (Copyright Elasticsearch BV)
+- `rules/signature-base`: [Detection Rule License 1.1](https://github.com/Neo23x0/signature-base/blob/master/LICENSE) (Copyright Florian Roth)
+

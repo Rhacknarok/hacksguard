@@ -3,6 +3,7 @@ name = "hacksguard"
 version = "0.4.0"
 edition = "2021"
 description = "TUI malware analysis tool"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 ratatui = "0.29"
