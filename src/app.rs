@@ -381,12 +381,26 @@ impl App {
         let _ = std::io::stdout().flush();
     }
 
+    pub fn sanitize_filename_component(s: &str) -> String {
+        let sanitized: String = s
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let trimmed = sanitized.trim_matches('_');
+        if trimmed.is_empty() {
+            "item".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     pub fn get_dump_targets(&self) -> Vec<DumpTarget> {
         let mut targets = Vec::new();
         let file_size = self.result.file_info.size as usize;
-        let base_name = self.result.file_info.path.file_stem()
+        let raw_base = self.result.file_info.path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("sample");
+        let base_name = Self::sanitize_filename_component(raw_base);
 
         if let Some(pe) = self.current_pe() {
             // 1. Unauthenticated Overlay
@@ -434,10 +448,11 @@ impl App {
                 let is_notable = res.type_id == 10 || res.magic_hint.is_some() || res.entropy > 6.5;
                 if is_notable && res.size > 0 && res.file_offset < file_size {
                     let ext = if res.magic_hint.as_deref() == Some("PE (MZ)") { "exe" } else { "bin" };
-                    let clean_id = res.name_or_id.replace('#', "id_");
+                    let clean_id = Self::sanitize_filename_component(&res.name_or_id.replace('#', "id_"));
+                    let clean_type = Self::sanitize_filename_component(&res.type_name);
                     targets.push(DumpTarget {
                         label: format!("Resource {}/{} ({} - ent: {:.2})", res.type_name, res.name_or_id, crate::ui::format_size(res.size as u64), res.entropy),
-                        filename: format!("{}_rsrc_{}_{}.{}", base_name, res.type_name, clean_id, ext),
+                        filename: format!("{}_rsrc_{}_{}.{}", base_name, clean_type, clean_id, ext),
                         offset: res.file_offset,
                         size: res.size,
                         xor_key: None,
@@ -450,6 +465,11 @@ impl App {
     }
 
     pub fn execute_dump(&self, target: &DumpTarget) -> std::result::Result<String, String> {
+        let path = std::path::Path::new(&target.filename);
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err("Path traversal detected in target filename".into());
+        }
+
         let data = std::fs::read(&self.result.file_info.path).map_err(|e| e.to_string())?;
         if target.offset >= data.len() {
             return Err("Offset out of bounds".into());
@@ -538,5 +558,63 @@ mod tests {
 
         let _ = std::fs::remove_file(src_file);
         let _ = std::fs::remove_file(out_file);
+    }
+
+    #[test]
+    fn test_sanitize_filename_component() {
+        assert_eq!(App::sanitize_filename_component("../../../../etc/passwd"), "etc_passwd");
+        assert_eq!(App::sanitize_filename_component(r"..\..\Windows\System32\calc.exe"), "Windows_System32_calc_exe");
+        assert_eq!(App::sanitize_filename_component("valid-name_01"), "valid-name_01");
+        assert_eq!(App::sanitize_filename_component("...///:::"), "item");
+    }
+
+    #[test]
+    fn test_execute_dump_prevents_path_traversal() {
+        let app = App::new(crate::models::AnalysisResult {
+            file_info: crate::models::FileInfo {
+                path: std::path::PathBuf::from("dummy.bin"),
+                name: "dummy.bin".into(),
+                size: 10,
+                file_type: crate::models::FileType::Unknown,
+                magic_bytes: vec![],
+            },
+            basic: crate::models::BasicAnalysis {
+                md5: "".into(),
+                sha1: "".into(),
+                sha256: "".into(),
+                entropy: 0.0,
+                strings: vec![],
+                is_packed: false,
+                byte_distribution: vec![0; 256],
+            },
+            pe: None,
+            elf: None,
+            macho: None,
+            risk_score: 0,
+            risk_level: crate::models::RiskLevel::Clean,
+            risk_breakdown: crate::models::RiskBreakdown {
+                entropy_score: 0,
+                api_score: 0,
+                anomaly_score: 0,
+                string_score: 0,
+                packing_score: 0,
+            },
+            detection_checks: vec![],
+            malware_pattern: None,
+            yara_matches: vec![],
+            entropy_graph: vec![],
+        });
+
+        let target = DumpTarget {
+            label: "Malicious Traversal".into(),
+            filename: "../../evil.bin".into(),
+            offset: 0,
+            size: 4,
+            xor_key: None,
+        };
+
+        let result = app.execute_dump(&target);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Path traversal"));
     }
 }

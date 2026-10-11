@@ -200,7 +200,20 @@ fn compute_entropy_graph(data: &[u8], num_chunks: usize) -> Vec<u64> {
 
 // ─── YARA persistent cache ───────────────────────────────────────
 
-const YARA_CACHE_PATH: &str = ".yara_cache";
+fn resolve_cache_path() -> std::path::PathBuf {
+    let cache_dir = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        std::path::PathBuf::from(xdg).join("hacksguard")
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".cache").join("hacksguard")
+    } else if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        std::path::PathBuf::from(local_app_data).join("hacksguard")
+    } else {
+        std::env::temp_dir().join("hacksguard_cache")
+    };
+
+    let _ = std::fs::create_dir_all(&cache_dir);
+    cache_dir.join("yara_cache.bin")
+}
 
 fn resolve_app_path(name: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(name);
@@ -258,7 +271,7 @@ fn compute_rules_fingerprint(rules_dir: &std::path::Path) -> Vec<u8> {
 /// Cache format: [32 bytes fingerprint][boreal-serialized Scanner]
 pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
     let rules_dir = resolve_app_path("rules");
-    let cache_path = resolve_app_path(YARA_CACHE_PATH);
+    let cache_path = resolve_cache_path();
     let fingerprint = compute_rules_fingerprint(&rules_dir);
 
     // Try loading from cache
