@@ -42,9 +42,13 @@ pub fn read_der_tlv<'a>(input: &mut &'a [u8]) -> Option<DerElement<'a>> {
 
 /// Parse WIN_CERTIFICATE structure and decode the leaf X.509 certificate.
 pub fn parse_authenticode(data: &[u8], offset: usize, size: usize) -> Option<CertificateInfo> {
-    if offset + 8 > data.len() || size < 8 {
+    if size < 8 {
         return None;
     }
+    let start = match offset.checked_add(8) {
+        Some(s) if s <= data.len() => s,
+        _ => return None,
+    };
 
     let dw_length = u32::from_le_bytes([
         data[offset],
@@ -60,11 +64,11 @@ pub fn parse_authenticode(data: &[u8], offset: usize, size: usize) -> Option<Cer
         return None;
     }
 
-    let end = (offset + dw_length).min(data.len()).min(offset + size);
-    if offset + 8 >= end {
+    let end = offset.saturating_add(dw_length).min(data.len()).min(offset.saturating_add(size));
+    if start >= end {
         return None;
     }
-    let der_bytes = &data[offset + 8..end];
+    let der_bytes = &data[start..end];
     parse_pkcs7_der(der_bytes)
 }
 
@@ -117,7 +121,8 @@ pub fn parse_pkcs7_der(der_bytes: &[u8]) -> Option<CertificateInfo> {
 /// Fallback: Scan buffer for any embedded SEQUENCE that parses as a valid X.509 certificate.
 fn scan_for_x509_cert(der_bytes: &[u8]) -> Option<CertificateInfo> {
     let mut offset = 0;
-    while offset + 32 < der_bytes.len() {
+    let max_scan = der_bytes.len().min(1024 * 1024);
+    while offset + 32 < max_scan {
         if der_bytes[offset] == 0x30 {
             let mut cur = &der_bytes[offset..];
             if let Some(elem) = read_der_tlv(&mut cur) {

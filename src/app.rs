@@ -339,7 +339,11 @@ impl App {
                 });
                 if let Some(s) = matching {
                     self.send_osc52(&s.value);
-                    let disp = if s.value.len() > 20 { format!("{}…", &s.value[..20]) } else { s.value.clone() };
+                    let disp = if s.value.chars().count() > 20 {
+                        format!("{}…", s.value.chars().take(20).collect::<String>())
+                    } else {
+                        s.value.clone()
+                    };
                     self.status_message = Some((format!("Copied string: {}", disp), std::time::Instant::now()));
                     return;
                 }

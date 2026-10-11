@@ -145,7 +145,7 @@ pub fn analyze(data: &[u8]) -> Result<ElfAnalysis> {
 
         let start = sh.sh_offset as usize;
         let size = sh.sh_size as usize;
-        let end = (start + size).min(data.len());
+        let end = start.saturating_add(size).min(data.len());
 
         let mut sec_anomalies = Vec::new();
         let entropy = if sh.sh_type != SHT_NOBITS && start < end && start < data.len() {

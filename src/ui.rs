@@ -637,6 +637,14 @@ fn build_packer_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     lines.push(Line::from(""));
 }
 
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        format!("{}…", s.chars().take(max_chars).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
 fn build_entropy_histogram_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     let (header, items): (&str, Vec<(&str, f64)>) = if let Some(pe) = app.current_pe() {
         ("Entropy by Section", pe.sections.iter().map(|s| (s.name.as_str(), s.entropy)).collect())
@@ -663,7 +671,7 @@ fn build_entropy_histogram_lines(lines: &mut Vec<Line<'static>>, app: &App) {
             theme::SAFE
         };
         let flag = if entropy > 7.0 { " ⚠" } else { "" };
-        let trunc = if name.len() > 10 { &name[..10] } else { name };
+        let trunc: String = name.chars().take(10).collect();
 
         lines.push(Line::from(vec![
             Span::styled(format!("   {:<10} ", trunc), theme::label()),
@@ -870,11 +878,7 @@ fn build_suspicious_strings_lines(lines: &mut Vec<Line<'static>>, app: &App) {
                 StringCategory::Normal => theme::TEXT_DIM,
             };
 
-            let display_val = if s.value.len() > 60 {
-                format!("{}…", &s.value[..60])
-            } else {
-                s.value.clone()
-            };
+            let display_val = truncate_str(&s.value, 60);
 
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1626,11 +1630,7 @@ fn draw_strings(frame: &mut Frame, area: Rect, app: &App) {
             StringCategory::Normal => theme::TEXT_DIM,
         };
 
-        let display_val = if s.value.len() > 100 {
-            format!("{}…", &s.value[..100])
-        } else {
-            s.value.clone()
-        };
+        let display_val = truncate_str(&s.value, 100);
 
         lines.push(Line::from(vec![
             Span::styled(
@@ -1651,11 +1651,7 @@ fn draw_strings(frame: &mut Frame, area: Rect, app: &App) {
         ]));
 
         if let Some(decoded) = &s.decoded {
-            let decoded_display = if decoded.len() > 100 {
-                format!("{}…", &decoded[..100])
-            } else {
-                decoded.clone()
-            };
+            let decoded_display = truncate_str(decoded, 100);
             let mut decoded_line = Vec::new();
             decoded_line.push(Span::styled(
                 "        ↳ Base64 Decoded: ",
@@ -3011,4 +3007,17 @@ fn draw_macho_disasm(frame: &mut Frame, area: Rect, app: &App) {
         &macho.ep_bytes,
         macho.entry_point,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_str_multibyte_utf8() {
+        let s = "🦀🔥✨🚀🎉 café résumé 日本語";
+        let res = truncate_str(s, 5);
+        assert_eq!(res, "🦀🔥✨🚀🎉…");
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
 }

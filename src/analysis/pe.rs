@@ -814,8 +814,9 @@ pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
         return None;
     }
 
+    let max_scan = data.len().min(64 * 1024 * 1024);
     let mut offset = start_offset;
-    while offset + 64 <= data.len() {
+    while offset + 64 <= max_scan {
         if data[offset] == 0x4D && data[offset + 1] == 0x5A { // 'MZ'
             let e_lfanew = u32::from_le_bytes([
                 data[offset + 0x3C],
@@ -824,7 +825,7 @@ pub fn find_embedded_pe(data: &[u8], parent_is_pe: bool) -> Option<PeAnalysis> {
                 data[offset + 0x3F],
             ]) as usize;
 
-            if e_lfanew > 0 && offset + e_lfanew + 4 <= data.len() {
+            if (0x40..=0x1000).contains(&e_lfanew) && offset.saturating_add(e_lfanew).saturating_add(4) <= data.len() {
                 if data[offset + e_lfanew] == 0x50
                     && data[offset + e_lfanew + 1] == 0x45
                     && data[offset + e_lfanew + 2] == 0x00
@@ -973,17 +974,19 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 fn iter_rsrc_entries(rsrc: &[u8], dir_offset: usize) -> impl Iterator<Item = (u32, u32)> + '_ {
     let num_named = read_u16(rsrc, dir_offset.saturating_add(12)).unwrap_or(0) as usize;
     let num_id = read_u16(rsrc, dir_offset.saturating_add(14)).unwrap_or(0) as usize;
-    let total = num_named + num_id;
+    let max_entries = (rsrc.len() / 8).min(2048);
+    let total = num_named.saturating_add(num_id).min(max_entries);
     (0..total).filter_map(move |i| {
-        let entry = dir_offset.checked_add(16 + i * 8)?;
-        Some((read_u32(rsrc, entry)?, read_u32(rsrc, entry + 4)?))
+        let entry = dir_offset.checked_add(16 + i.checked_mul(8)?)?;
+        Some((read_u32(rsrc, entry)?, read_u32(rsrc, entry.checked_add(4)?)?))
     })
 }
 
 fn read_rsrc_string(rsrc: &[u8], offset: usize) -> Option<String> {
     let len = read_u16(rsrc, offset)? as usize;
-    let bytes_start = offset + 2;
-    let bytes_end = bytes_start.checked_add(len.checked_mul(2)?)?;
+    let bytes_start = offset.checked_add(2)?;
+    let byte_len = len.checked_mul(2)?;
+    let bytes_end = bytes_start.checked_add(byte_len)?;
     if bytes_end <= rsrc.len() {
         let u16s: Vec<u16> = rsrc[bytes_start..bytes_end]
             .chunks_exact(2)
@@ -1044,9 +1047,16 @@ fn parse_resources_and_manifest(
 ) -> (Vec<ResourceEntry>, Option<String>) {
     let mut resources = Vec::new();
     let mut manifest = None;
+    let mut visited_dirs = std::collections::HashSet::new();
+    visited_dirs.insert(0);
+
+    const MAX_RESOURCES: usize = 2048;
 
     // Level 1: Type
     for (type_id_raw, off1) in iter_rsrc_entries(rsrc_bytes, 0) {
+        if resources.len() >= MAX_RESOURCES {
+            break;
+        }
         let (type_id, type_name_custom) = if (type_id_raw & 0x8000_0000) != 0 {
             let str_off = (type_id_raw & 0x7FFF_FFFF) as usize;
             (type_id_raw, read_rsrc_string(rsrc_bytes, str_off))
@@ -1057,8 +1067,14 @@ fn parse_resources_and_manifest(
 
         if (off1 & 0x8000_0000) != 0 {
             let dir2_off = (off1 & 0x7FFF_FFFF) as usize;
+            if dir2_off >= rsrc_bytes.len() || !visited_dirs.insert(dir2_off) {
+                continue;
+            }
             // Level 2: Name or ID
             for (name_id_raw, off2) in iter_rsrc_entries(rsrc_bytes, dir2_off) {
+                if resources.len() >= MAX_RESOURCES {
+                    break;
+                }
                 let name_or_id = if (name_id_raw & 0x8000_0000) != 0 {
                     let str_off = (name_id_raw & 0x7FFF_FFFF) as usize;
                     read_rsrc_string(rsrc_bytes, str_off).unwrap_or_else(|| format!("{:#x}", name_id_raw))
@@ -1068,11 +1084,17 @@ fn parse_resources_and_manifest(
 
                 if (off2 & 0x8000_0000) != 0 {
                     let dir3_off = (off2 & 0x7FFF_FFFF) as usize;
+                    if dir3_off >= rsrc_bytes.len() || !visited_dirs.insert(dir3_off) {
+                        continue;
+                    }
                     // Level 3: Language
                     for (lang_raw, data_off_raw) in iter_rsrc_entries(rsrc_bytes, dir3_off) {
+                        if resources.len() >= MAX_RESOURCES {
+                            break;
+                        }
                         if (data_off_raw & 0x8000_0000) == 0 {
                             let leaf_off = data_off_raw as usize;
-                            if let (Some(rva), Some(size)) = (read_u32(rsrc_bytes, leaf_off), read_u32(rsrc_bytes, leaf_off + 4)) {
+                            if let (Some(rva), Some(size)) = (read_u32(rsrc_bytes, leaf_off), read_u32(rsrc_bytes, leaf_off.saturating_add(4))) {
                                 let rva = rva as usize;
                                 let size = size as usize;
                                 let file_offset = goblin::pe::utils::find_offset(
@@ -1083,7 +1105,7 @@ fn parse_resources_and_manifest(
                                 ).unwrap_or(0);
 
                                 if file_offset > 0 && file_offset < full_data.len() {
-                                    let end = (file_offset + size).min(full_data.len());
+                                    let end = file_offset.saturating_add(size).min(full_data.len());
                                     let actual_slice = &full_data[file_offset..end];
                                     let entropy = shannon_entropy(actual_slice);
                                     let magic_hint = detect_magic_hint(actual_slice);

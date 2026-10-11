@@ -126,7 +126,7 @@ fn analyze_single(macho: &MachO, data: &[u8]) -> Result<MachoAnalysis> {
                 let is_sect_write = is_write;
 
                 let start = offset as usize;
-                let end = (start + size as usize).min(data.len());
+                let end = start.saturating_add(size as usize).min(data.len());
 
                 let mut sec_anomalies = Vec::new();
                 let is_zerofill = (sect.flags & 0xff) == 1; // S_ZEROFILL
@@ -200,7 +200,7 @@ fn analyze_single(macho: &MachO, data: &[u8]) -> Result<MachoAnalysis> {
         let is_exec = (seg.initprot & 0x04) != 0;
         if is_exec && seg.filesize > 0 {
             let start = seg.fileoff as usize;
-            let end = (start + seg.filesize as usize).min(data.len());
+            let end = start.saturating_add(seg.filesize as usize).min(data.len());
             if start < end {
                 let code = &data[start..end];
                 if is_arm64 {

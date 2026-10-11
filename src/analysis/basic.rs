@@ -71,7 +71,12 @@ fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
     let mut current = Vec::new();
     let mut start_offset = 0;
 
-    let mut push_entry = |buf: &mut Vec<u8>, offset: usize, is_wide: bool| {
+    const MAX_STRINGS: usize = 20_000;
+    let push_entry = |results: &mut Vec<ExtractedString>, buf: &mut Vec<u8>, offset: usize, is_wide: bool| {
+        if results.len() >= MAX_STRINGS {
+            buf.clear();
+            return;
+        }
         if buf.len() >= min_len {
             let s = String::from_utf8_lossy(buf).to_string();
             let category = categorize_string(&s);
@@ -92,30 +97,36 @@ fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
         buf.clear();
     };
 
-    let mut ascii_occupied = vec![false; data.len()];
+    let occ_len = data.len().min(64 * 1024 * 1024);
+    let mut ascii_occupied = vec![false; occ_len];
 
     for (i, &b) in data.iter().enumerate() {
+        if results.len() >= MAX_STRINGS {
+            break;
+        }
         if b.is_ascii_graphic() || b == b' ' {
             if current.is_empty() {
                 start_offset = i;
             }
             current.push(b);
         } else {
-            if current.len() >= min_len {
-                ascii_occupied[start_offset..start_offset + current.len()].fill(true);
+            if current.len() >= min_len && start_offset < occ_len {
+                let fill_end = (start_offset + current.len()).min(occ_len);
+                ascii_occupied[start_offset..fill_end].fill(true);
             }
-            push_entry(&mut current, start_offset, false);
+            push_entry(&mut results, &mut current, start_offset, false);
         }
     }
-    if current.len() >= min_len {
-        ascii_occupied[start_offset..start_offset + current.len()].fill(true);
+    if current.len() >= min_len && start_offset < occ_len {
+        let fill_end = (start_offset + current.len()).min(occ_len);
+        ascii_occupied[start_offset..fill_end].fill(true);
     }
-    push_entry(&mut current, start_offset, false);
+    push_entry(&mut results, &mut current, start_offset, false);
 
-    if data.len() >= 2 {
+    if data.len() >= 2 && results.len() < MAX_STRINGS {
         for align in 0..=1 {
             let mut i = align;
-            while i + 1 < data.len() {
+            while i + 1 < data.len() && results.len() < MAX_STRINGS {
                 let b0 = data[i];
                 let b1 = data[i + 1];
                 if b1 == 0 && (b0.is_ascii_graphic() || b0 == b' ') {
@@ -124,19 +135,19 @@ fn extract_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
                     }
                     current.push(b0);
                 } else {
-                    while !current.is_empty() && start_offset < data.len() && ascii_occupied[start_offset] {
+                    while !current.is_empty() && start_offset < occ_len && ascii_occupied[start_offset] {
                         current.remove(0);
                         start_offset += 2;
                     }
-                    push_entry(&mut current, start_offset, true);
+                    push_entry(&mut results, &mut current, start_offset, true);
                 }
                 i += 2;
             }
-            while !current.is_empty() && start_offset < data.len() && ascii_occupied[start_offset] {
+            while !current.is_empty() && start_offset < occ_len && ascii_occupied[start_offset] {
                 current.remove(0);
                 start_offset += 2;
             }
-            push_entry(&mut current, start_offset, true);
+            push_entry(&mut results, &mut current, start_offset, true);
         }
     }
 
