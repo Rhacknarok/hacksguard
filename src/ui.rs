@@ -638,73 +638,41 @@ fn build_packer_lines(lines: &mut Vec<Line<'static>>, app: &App) {
 }
 
 fn build_entropy_histogram_lines(lines: &mut Vec<Line<'static>>, app: &App) {
-    if let Some(pe) = app.current_pe() {
-        lines.push(section_header("Entropy by Section"));
-
-        let bar_w = 25usize;
-        for section in &pe.sections {
-            let filled = ((section.entropy / 8.0) * bar_w as f64) as usize;
-            let empty = bar_w.saturating_sub(filled);
-
-            let color = if section.entropy > 7.0 {
-                theme::CRITICAL
-            } else if section.entropy > 6.0 {
-                theme::WARNING
-            } else {
-                theme::SAFE
-            };
-
-            let flag = if section.entropy > 7.0 { " ⚠" } else { "" };
-            let name = format!("{:<8}", section.name);
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {} ", name), theme::label()),
-                Span::styled("█".repeat(filled), Style::default().fg(color)),
-                Span::styled("░".repeat(empty), Style::default().fg(theme::BORDER)),
-                Span::styled(
-                    format!(" {:.2}{}", section.entropy, flag),
-                    Style::default().fg(color),
-                ),
-            ]));
-        }
-        lines.push(Line::from(""));
+    let (header, items): (&str, Vec<(&str, f64)>) = if let Some(pe) = app.current_pe() {
+        ("Entropy by Section", pe.sections.iter().map(|s| (s.name.as_str(), s.entropy)).collect())
     } else if let Some(elf) = app.result.elf.as_ref() {
-        if !elf.sections.is_empty() {
-            lines.push(section_header("Entropy by Section (ELF)"));
+        ("Entropy by Section (ELF)", elf.sections.iter().filter(|s| s.raw_size > 0).map(|s| (s.name.as_str(), s.entropy)).collect())
+    } else {
+        return;
+    };
 
-            let bar_w = 25usize;
-            for section in &elf.sections {
-                if section.raw_size == 0 {
-                    continue;
-                }
-                let filled = ((section.entropy / 8.0) * bar_w as f64) as usize;
-                let empty = bar_w.saturating_sub(filled);
-
-                let color = if section.entropy > 7.0 {
-                    theme::CRITICAL
-                } else if section.entropy > 6.0 {
-                    theme::WARNING
-                } else {
-                    theme::SAFE
-                };
-
-                let flag = if section.entropy > 7.0 { " ⚠" } else { "" };
-                let display_name = if section.name.len() > 10 { &section.name[..10] } else { &section.name };
-                let name = format!("{:<10}", display_name);
-
-                lines.push(Line::from(vec![
-                    Span::styled(format!("   {} ", name), theme::label()),
-                    Span::styled("█".repeat(filled), Style::default().fg(color)),
-                    Span::styled("░".repeat(empty), Style::default().fg(theme::BORDER)),
-                    Span::styled(
-                        format!(" {:.2}{}", section.entropy, flag),
-                        Style::default().fg(color),
-                    ),
-                ]));
-            }
-            lines.push(Line::from(""));
-        }
+    if items.is_empty() {
+        return;
     }
+
+    lines.push(section_header(header));
+    const BAR_W: usize = 25;
+    for (name, entropy) in items {
+        let filled = ((entropy / 8.0) * BAR_W as f64) as usize;
+        let empty = BAR_W.saturating_sub(filled);
+        let color = if entropy > 7.0 {
+            theme::CRITICAL
+        } else if entropy > 6.0 {
+            theme::WARNING
+        } else {
+            theme::SAFE
+        };
+        let flag = if entropy > 7.0 { " ⚠" } else { "" };
+        let trunc = if name.len() > 10 { &name[..10] } else { name };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {:<10} ", trunc), theme::label()),
+            Span::styled("█".repeat(filled), Style::default().fg(color)),
+            Span::styled("░".repeat(empty), Style::default().fg(theme::BORDER)),
+            Span::styled(format!(" {:.2}{}", entropy, flag), Style::default().fg(color)),
+        ]));
+    }
+    lines.push(Line::from(""));
 }
 
 fn build_byte_distribution_lines(lines: &mut Vec<Line<'static>>, app: &App) {
@@ -2632,21 +2600,25 @@ fn draw_elf_sections(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(table, area);
 }
 
-fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(elf) = app.result.elf.as_ref() else {
-        frame.render_widget(Paragraph::new(" No ELF symbols"), area);
-        return;
-    };
-
+fn render_symbol_imports(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    block_title: &str,
+    lib_header: &str,
+    libs: &[String],
+    imported_symbols: &[ImportFunction],
+    exported_symbols: &[String],
+) {
     let mut lines = Vec::new();
 
-    let crit = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Critical).count();
-    let high = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::High).count();
-    let med = elf.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Medium).count();
+    let crit = imported_symbols.iter().filter(|f| f.risk == ApiRisk::Critical).count();
+    let high = imported_symbols.iter().filter(|f| f.risk == ApiRisk::High).count();
+    let med = imported_symbols.iter().filter(|f| f.risk == ApiRisk::Medium).count();
 
     lines.push(Line::from(vec![
         Span::styled(
-            format!(" {} Imported Functions across {} Shared Libraries  ", elf.imported_symbols.len(), elf.libraries.len()),
+            format!(" {} Imported Symbols across {} Libraries  ", imported_symbols.len(), libs.len()),
             theme::value(),
         ),
         Span::styled(format!("● {} ", crit), Style::default().fg(theme::CRITICAL)),
@@ -2655,9 +2627,9 @@ fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
     ]));
     lines.push(Line::from(""));
 
-    if !elf.libraries.is_empty() {
-        lines.push(section_header("Shared Libraries (DT_NEEDED)"));
-        for lib in &elf.libraries {
+    if !libs.is_empty() {
+        lines.push(section_header(lib_header));
+        for lib in libs {
             lines.push(Line::from(vec![
                 Span::styled("   ▸ ", Style::default().fg(theme::ORANGE_LIGHT)),
                 Span::styled(lib, Style::default().fg(theme::INFO)),
@@ -2668,8 +2640,7 @@ fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
 
     let query_lower = app.search_query.to_lowercase();
     lines.push(section_header("Imported Dynamic Symbols"));
-    for sym in elf
-        .imported_symbols
+    for sym in imported_symbols
         .iter()
         .filter(|s| query_lower.is_empty() || s.name.to_lowercase().contains(&query_lower))
     {
@@ -2693,7 +2664,20 @@ fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
         ]));
     }
 
-    let block = panel_block("ELF Symbols & Imports");
+    if !exported_symbols.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Exported Symbols"));
+        for exp in exported_symbols {
+            if query_lower.is_empty() || exp.to_lowercase().contains(&query_lower) {
+                lines.push(Line::from(vec![
+                    Span::styled("    ▸ ", Style::default().fg(theme::ORANGE_LIGHT)),
+                    Span::styled(exp, Style::default().fg(theme::TEXT)),
+                ]));
+            }
+        }
+    }
+
+    let block = panel_block(block_title);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -2703,28 +2687,20 @@ fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_binary_disasm(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    title: &'static str,
-    arch: &str,
-    syscall_locations: &[crate::models::SyscallLocation],
-    is_64bit: bool,
-    ep_bytes: &[u8],
-    entry_point: u64,
-) {
-    let is_arm64 = arch.contains("ARM64") || arch.contains("AArch64");
-    render_disasm(
+fn draw_elf_imports(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(elf) = app.result.elf.as_ref() else {
+        frame.render_widget(Paragraph::new(" No ELF symbols"), area);
+        return;
+    };
+    render_symbol_imports(
         frame,
         area,
-        app.scroll_offset,
-        title,
-        syscall_locations,
-        is_64bit,
-        is_arm64,
-        ep_bytes,
-        entry_point,
+        app,
+        "ELF Symbols & Imports",
+        "Shared Libraries (DT_NEEDED)",
+        &elf.libraries,
+        &elf.imported_symbols,
+        &elf.exported_symbols,
     );
 }
 
@@ -2733,14 +2709,15 @@ fn draw_elf_disasm(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(" No ELF metadata for disassembly"), area);
         return;
     };
-    draw_binary_disasm(
+    let is_arm64 = elf.machine.contains("ARM64") || elf.machine.contains("AArch64");
+    render_disasm(
         frame,
         area,
-        app,
+        app.scroll_offset,
         "ELF Disassembly",
-        &elf.machine,
         &elf.syscall_locations,
         elf.is_64bit,
+        is_arm64,
         &elf.ep_bytes,
         elf.entry_point,
     );
@@ -3005,82 +2982,15 @@ fn draw_macho_imports(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(" No Mach-O symbols"), area);
         return;
     };
-
-    let mut lines = Vec::new();
-
-    let crit = macho.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Critical).count();
-    let high = macho.imported_symbols.iter().filter(|f| f.risk == ApiRisk::High).count();
-    let med = macho.imported_symbols.iter().filter(|f| f.risk == ApiRisk::Medium).count();
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {} Imported Symbols across {} Dylibs  ", macho.imported_symbols.len(), macho.dylibs.len()),
-            theme::value(),
-        ),
-        Span::styled(format!("● {} ", crit), Style::default().fg(theme::CRITICAL)),
-        Span::styled(format!("● {} ", high), Style::default().fg(theme::ORANGE)),
-        Span::styled(format!("● {} ", med), Style::default().fg(theme::WARNING)),
-    ]));
-    lines.push(Line::from(""));
-
-    if !macho.dylibs.is_empty() {
-        lines.push(section_header("Dependent Dynamic Libraries (LC_LOAD_DYLIB)"));
-        for lib in &macho.dylibs {
-            lines.push(Line::from(vec![
-                Span::styled("   ▸ ", Style::default().fg(theme::ORANGE_LIGHT)),
-                Span::styled(lib, Style::default().fg(theme::INFO)),
-            ]));
-        }
-        lines.push(Line::from(""));
-    }
-
-    let query_lower = app.search_query.to_lowercase();
-    lines.push(section_header("Imported Dynamic Symbols"));
-    for sym in macho
-        .imported_symbols
-        .iter()
-        .filter(|s| query_lower.is_empty() || s.name.to_lowercase().contains(&query_lower))
-    {
-        let color = theme::api_risk_color(&sym.risk);
-        let marker = match sym.risk {
-            ApiRisk::Critical => "●",
-            ApiRisk::High => "◉",
-            ApiRisk::Medium => "○",
-            _ => "·",
-        };
-        let risk_tag = if sym.risk != ApiRisk::None {
-            format!(" [{}]", sym.risk)
-        } else {
-            String::new()
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(format!("    {} ", marker), Style::default().fg(color)),
-            Span::styled(&sym.name, Style::default().fg(theme::TEXT)),
-            Span::styled(risk_tag, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        ]));
-    }
-
-    if !macho.exported_symbols.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(section_header("Exported Symbols"));
-        for exp in &macho.exported_symbols {
-            if query_lower.is_empty() || exp.to_lowercase().contains(&query_lower) {
-                lines.push(Line::from(vec![
-                    Span::styled("    ▸ ", Style::default().fg(theme::ORANGE_LIGHT)),
-                    Span::styled(exp, Style::default().fg(theme::TEXT)),
-                ]));
-            }
-        }
-    }
-
-    let block = panel_block("Mach-O Symbols & Imports");
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((app.scroll_offset, 0)),
+    render_symbol_imports(
+        frame,
         area,
+        app,
+        "Mach-O Symbols & Imports",
+        "Dependent Dynamic Libraries (LC_LOAD_DYLIB)",
+        &macho.dylibs,
+        &macho.imported_symbols,
+        &macho.exported_symbols,
     );
 }
 
@@ -3089,14 +2999,15 @@ fn draw_macho_disasm(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(" No Mach-O metadata for disassembly"), area);
         return;
     };
-    draw_binary_disasm(
+    let is_arm64 = macho.cpu_type.contains("ARM64") || macho.cpu_type.contains("AArch64");
+    render_disasm(
         frame,
         area,
-        app,
+        app.scroll_offset,
         "Mach-O Disassembly",
-        &macho.cpu_type,
         &macho.syscall_locations,
         macho.is_64bit,
+        is_arm64,
         &macho.ep_bytes,
         macho.entry_point,
     );

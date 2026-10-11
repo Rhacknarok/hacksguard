@@ -341,6 +341,7 @@ impl App {
                     self.send_osc52(&s.value);
                     let disp = if s.value.len() > 20 { format!("{}…", &s.value[..20]) } else { s.value.clone() };
                     self.status_message = Some((format!("Copied string: {}", disp), std::time::Instant::now()));
+                    return;
                 }
             }
             "Headers" => {
@@ -355,20 +356,16 @@ impl App {
                     self.send_osc52(&val);
                     let short = if val.len() > 12 { &val[..12] } else { &val };
                     self.status_message = Some((format!("Copied {}: {}…", label, short), std::time::Instant::now()));
-                } else {
-                    let sha256 = self.result.basic.sha256.clone();
-                    self.send_osc52(&sha256);
-                    let short = if sha256.len() > 12 { &sha256[..12] } else { &sha256 };
-                    self.status_message = Some((format!("Copied SHA-256: {}…", short), std::time::Instant::now()));
+                    return;
                 }
             }
-            _ => {
-                let sha256 = self.result.basic.sha256.clone();
-                self.send_osc52(&sha256);
-                let short = if sha256.len() > 12 { &sha256[..12] } else { &sha256 };
-                self.status_message = Some((format!("Copied SHA-256: {}…", short), std::time::Instant::now()));
-            }
+            _ => {}
         }
+
+        let sha256 = self.result.basic.sha256.clone();
+        self.send_osc52(&sha256);
+        let short = if sha256.len() > 12 { &sha256[..12] } else { &sha256 };
+        self.status_message = Some((format!("Copied SHA-256: {}…", short), std::time::Instant::now()));
     }
 
     pub fn format_osc52(text: &str) -> String {

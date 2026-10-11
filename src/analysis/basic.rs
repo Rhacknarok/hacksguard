@@ -3,25 +3,17 @@ use sha2::{Digest, Sha256};
 
 /// Run basic (format-agnostic) analysis: hashes, entropy, strings.
 pub fn analyze(data: &[u8]) -> BasicAnalysis {
-    let ((md5, sha1), (sha256, (strings, (byte_distribution, entropy)))) = rayon::join(
+    let ((md5, sha1, sha256), (strings, (byte_distribution, entropy))) = rayon::join(
+        || (compute_hash::<md5::Md5>(data), compute_hash::<sha1::Sha1>(data), compute_hash::<Sha256>(data)),
         || rayon::join(
-            || compute_hash::<md5::Md5>(data),
-            || compute_hash::<sha1::Sha1>(data),
-        ),
-        || rayon::join(
-            || compute_hash::<Sha256>(data),
-            || rayon::join(
-                || extract_strings(data, 4),
-                || {
-                    let freq = byte_frequencies(data);
-                    let ent = entropy_from_frequencies(&freq, data.len());
-                    (freq.to_vec(), ent)
-                },
-            ),
+            || extract_strings(data, 4),
+            || {
+                let freq = byte_frequencies(data);
+                let ent = entropy_from_frequencies(&freq, data.len());
+                (freq.to_vec(), ent)
+            },
         ),
     );
-
-    let is_packed = entropy > 7.0;
 
     BasicAnalysis {
         md5,
@@ -29,7 +21,7 @@ pub fn analyze(data: &[u8]) -> BasicAnalysis {
         sha256,
         entropy,
         strings,
-        is_packed,
+        is_packed: entropy > 7.0,
         byte_distribution,
     }
 }
@@ -37,10 +29,11 @@ pub fn analyze(data: &[u8]) -> BasicAnalysis {
 // ─── Hashing ─────────────────────────────────────────────────────
 
 fn compute_hash<D: Digest>(data: &[u8]) -> String {
-    D::digest(data)
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    use std::fmt::Write;
+    D::digest(data).iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{:02x}", b);
+        s
+    })
 }
 
 // ─── Entropy ─────────────────────────────────────────────────────

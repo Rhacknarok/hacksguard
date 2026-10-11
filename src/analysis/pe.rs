@@ -509,8 +509,7 @@ pub fn compute_imphash(imports: &[goblin::pe::import::Import]) -> Option<String>
         };
         entries.push(format!("{}.{}", lib_name, func_name));
     }
-    let joined = entries.join(",");
-    Some(Md5::digest(joined.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect())
+    Some(format!("{:x}", Md5::digest(entries.join(",").as_bytes())))
 }
 
 fn lookup_tool_name(prod_id: u16) -> Option<&'static str> {
@@ -685,48 +684,24 @@ fn format_timestamp(ts: u32) -> String {
     if ts == 0 {
         return "0 (invalid/stripped)".into();
     }
-    // Simple UTC conversion (seconds since 1970-01-01)
-    let secs = ts as u64;
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Rough date calc (no leap-second precision needed for malware analysis)
-    let mut year = 1970u64;
-    let mut remaining_days = days;
-    loop {
-        let days_in_year = if is_leap(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
+    let z = (ts as i64) / 86400 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
     }
-    let month_days: [u64; 12] = if is_leap(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 0;
-    for (i, &md) in month_days.iter().enumerate() {
-        if remaining_days < md {
-            month = i + 1;
-            break;
-        }
-        remaining_days -= md;
-    }
-    let day = remaining_days + 1;
 
+    let tod = (ts as u64) % 86400;
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-        year, month, day, hours, minutes, seconds
+        y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60
     )
-}
-
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 // ─── Packer detection ────────────────────────────────────────────

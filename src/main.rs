@@ -6,10 +6,6 @@ mod models;
 mod theme;
 mod ui;
 
-#[cfg(target_os = "linux")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 use clap::Parser;
 use crate::models::Result;
 use std::path::PathBuf;

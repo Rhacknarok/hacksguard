@@ -144,7 +144,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
                 }
                 let in_strings = basic_result.strings.iter().any(|s| {
                     s.value.to_lowercase().contains(&api_lower) || 
-                    s.decoded.as_ref().map_or(false, |d| d.to_lowercase().contains(&api_lower))
+                    s.decoded.as_ref().is_some_and(|d| d.to_lowercase().contains(&api_lower))
                 });
                 if in_strings {
                     obfuscated.push(api.to_string());
@@ -220,7 +220,7 @@ fn visit_dirs(dir: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
             let path = entry.path();
             if path.is_dir() {
                 visit_dirs(&path, paths);
-            } else if path.extension().map_or(false, |ext| ext == "yar" || ext == "yara") {
+            } else if path.extension().is_some_and(|ext| ext == "yar" || ext == "yara") {
                 paths.push(path);
             }
         }
@@ -245,7 +245,7 @@ fn compute_rules_fingerprint(rules_dir: &std::path::Path) -> Vec<u8> {
         hasher.update(normalized.as_bytes());
 
         if let Ok(content) = std::fs::read(path) {
-            hasher.update(&(content.len() as u64).to_le_bytes());
+            hasher.update((content.len() as u64).to_le_bytes());
             hasher.update(&content);
         }
     }
@@ -307,14 +307,17 @@ fn detect_type(magic: &[u8]) -> FileType {
     } else if magic.len() >= 4 && magic[0..4] == [0x7F, b'E', b'L', b'F'] {
         FileType::ELF
     } else if magic.len() >= 4
-        && ((magic[0..4] == [0xFE, 0xED, 0xFA, 0xCE])
-            || (magic[0..4] == [0xFE, 0xED, 0xFA, 0xCF])
-            || (magic[0..4] == [0xCE, 0xFA, 0xED, 0xFE])
-            || (magic[0..4] == [0xCF, 0xFA, 0xED, 0xFE])
-            || (magic[0..4] == [0xCA, 0xFE, 0xBA, 0xBE])
-            || (magic[0..4] == [0xBE, 0xBA, 0xFE, 0xCA])
-            || (magic[0..4] == [0xCA, 0xFE, 0xBA, 0xBF])
-            || (magic[0..4] == [0xBF, 0xBA, 0xFE, 0xCA]))
+        && matches!(
+            &magic[..4],
+            [0xFE, 0xED, 0xFA, 0xCE]
+                | [0xFE, 0xED, 0xFA, 0xCF]
+                | [0xCE, 0xFA, 0xED, 0xFE]
+                | [0xCF, 0xFA, 0xED, 0xFE]
+                | [0xCA, 0xFE, 0xBA, 0xBE]
+                | [0xBE, 0xBA, 0xFE, 0xCA]
+                | [0xCA, 0xFE, 0xBA, 0xBF]
+                | [0xBF, 0xBA, 0xFE, 0xCA]
+        )
     {
         FileType::MachO
     } else {
@@ -1013,7 +1016,7 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
     let mut instruction = iced_x86::Instruction::default();
     while decoder.can_decode() {
         decoder.decode_out(&mut instruction);
-        instructions.push(instruction.clone());
+        instructions.push(instruction);
     }
 
     let mut formatter = NasmFormatter::new();
@@ -1030,14 +1033,14 @@ pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: 
             let mut ssn = None;
             let start_check = idx.saturating_sub(10);
             for prev_instr in &instructions[start_check..idx] {
-                if prev_instr.mnemonic() == Mnemonic::Mov {
-                    if prev_instr.op0_kind() == OpKind::Register {
-                        let dest_reg = prev_instr.op0_register();
-                        if dest_reg == Register::EAX || dest_reg == Register::RAX {
-                            let op1 = prev_instr.op1_kind();
-                            if op1 == OpKind::Immediate8 || op1 == OpKind::Immediate8to32 || op1 == OpKind::Immediate8to64 || op1 == OpKind::Immediate32 || op1 == OpKind::Immediate32to64 || op1 == OpKind::Immediate64 {
-                                ssn = Some(prev_instr.immediate32());
-                            }
+                if prev_instr.mnemonic() == Mnemonic::Mov
+                    && prev_instr.op0_kind() == OpKind::Register
+                {
+                    let dest_reg = prev_instr.op0_register();
+                    if dest_reg == Register::EAX || dest_reg == Register::RAX {
+                        let op1 = prev_instr.op1_kind();
+                        if op1 == OpKind::Immediate8 || op1 == OpKind::Immediate8to32 || op1 == OpKind::Immediate8to64 || op1 == OpKind::Immediate32 || op1 == OpKind::Immediate32to64 || op1 == OpKind::Immediate64 {
+                            ssn = Some(prev_instr.immediate32());
                         }
                     }
                 }
@@ -1249,7 +1252,7 @@ mod tests {
         assert!(direct);
         assert!(!indirect);
         assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0].is_indirect, false);
+        assert!(!locations[0].is_indirect);
 
         // Indirect Syscall test
         let indirect_code = [
@@ -1261,6 +1264,6 @@ mod tests {
         assert!(!direct);
         assert!(indirect);
         assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0].is_indirect, true);
+        assert!(locations[0].is_indirect);
     }
 }
