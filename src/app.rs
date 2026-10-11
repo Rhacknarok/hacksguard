@@ -5,6 +5,15 @@ use ratatui::DefaultTerminal;
 use std::time::Duration;
 
 
+#[derive(Clone, Debug)]
+pub struct DumpTarget {
+    pub label: String,
+    pub filename: String,
+    pub offset: usize,
+    pub size: usize,
+    pub xor_key: Option<u8>,
+}
+
 pub struct App {
     pub result: AnalysisResult,
     pub current_tab: usize,
@@ -21,6 +30,9 @@ pub struct App {
     pub is_searching: bool,
     pub string_category_filter: Option<crate::models::StringCategory>,
     pub status_message: Option<(String, std::time::Instant)>,
+    pub show_dump_modal: bool,
+    pub dump_targets: Vec<DumpTarget>,
+    pub dump_selected_idx: usize,
 }
 
 impl App {
@@ -41,6 +53,9 @@ impl App {
             is_searching: false,
             string_category_filter: None,
             status_message: None,
+            show_dump_modal: false,
+            dump_targets: Vec::new(),
+            dump_selected_idx: 0,
         };
         app.rebuild_tabs();
         app
@@ -89,6 +104,34 @@ impl App {
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if self.show_dump_modal {
+                        match key.code {
+                            KeyCode::Esc => {
+                                self.show_dump_modal = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if self.dump_selected_idx > 0 {
+                                    self.dump_selected_idx -= 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if self.dump_selected_idx + 1 < self.dump_targets.len() {
+                                    self.dump_selected_idx += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(target) = self.dump_targets.get(self.dump_selected_idx).cloned() {
+                                    self.show_dump_modal = false;
+                                    match self.execute_dump(&target) {
+                                        Ok(msg) => self.status_message = Some((msg, std::time::Instant::now())),
+                                        Err(err) => self.status_message = Some((format!("Dump failed: {}", err), std::time::Instant::now())),
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
                     if self.is_searching {
@@ -160,6 +203,21 @@ impl App {
                         KeyCode::Char('y') => {
                             self.copy_to_clipboard();
                         }
+                        KeyCode::Char('d') => {
+                            let targets = self.get_dump_targets();
+                            if targets.is_empty() {
+                                self.status_message = Some(("No dumpable payloads identified in binary".into(), std::time::Instant::now()));
+                            } else if targets.len() == 1 {
+                                match self.execute_dump(&targets[0]) {
+                                    Ok(msg) => self.status_message = Some((msg, std::time::Instant::now())),
+                                    Err(err) => self.status_message = Some((format!("Dump failed: {}", err), std::time::Instant::now())),
+                                }
+                            } else {
+                                self.dump_targets = targets;
+                                self.dump_selected_idx = 0;
+                                self.show_dump_modal = true;
+                            }
+                        }
                         KeyCode::Char('e') => {
                             if self.result.pe.as_ref().is_some_and(|pe| pe.embedded_pe.is_some()) {
                                 self.inspect_embedded = !self.inspect_embedded;
@@ -218,6 +276,9 @@ impl App {
             tab_names.push("Headers".into());
             tab_names.push("Sections".into());
             tab_names.push("Imports".into());
+            if !pe.resources.is_empty() {
+                tab_names.push("Resources".into());
+            }
             tab_names.push("Disasm".into());
             if pe.manifest.is_some() {
                 tab_names.push("Manifest".into());
@@ -322,6 +383,90 @@ impl App {
         let _ = std::io::stdout().write_all(osc.as_bytes());
         let _ = std::io::stdout().flush();
     }
+
+    pub fn get_dump_targets(&self) -> Vec<DumpTarget> {
+        let mut targets = Vec::new();
+        let file_size = self.result.file_info.size as usize;
+        let base_name = self.result.file_info.path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sample");
+
+        if let Some(pe) = self.current_pe() {
+            // 1. Unauthenticated Overlay
+            if let (Some(off), Some(sz)) = (pe.overlay_offset, pe.overlay_size) {
+                if sz > 0 && off < file_size {
+                    targets.push(DumpTarget {
+                        label: format!("Overlay Data (offset {:#x}, size {})", off, crate::ui::format_size(sz as u64)),
+                        filename: format!("{}_overlay_{:#x}.bin", base_name, off),
+                        offset: off,
+                        size: sz,
+                        xor_key: None,
+                    });
+                }
+            }
+
+            // 2. XOR Payloads
+            for (i, p) in pe.xor_payloads.iter().enumerate() {
+                let sz = (file_size.saturating_sub(p.offset)).min(1024 * 1024);
+                if sz > 0 {
+                    targets.push(DumpTarget {
+                        label: format!("XOR Decrypted #{} (key {:#04x}, {})", i + 1, p.key, p.target_location),
+                        filename: format!("{}_xor_key_{:#04x}_{:#x}.bin", base_name, p.key, p.offset),
+                        offset: p.offset,
+                        size: sz,
+                        xor_key: Some(p.key),
+                    });
+                }
+            }
+
+            // 3. Embedded PE Executable
+            if pe.embedded_pe.is_some() {
+                if let Some(off) = pe.overlay_offset {
+                    targets.push(DumpTarget {
+                        label: format!("Embedded PE Executable (offset {:#x})", off),
+                        filename: format!("{}_embedded_pe_{:#x}.exe", base_name, off),
+                        offset: off,
+                        size: file_size.saturating_sub(off),
+                        xor_key: None,
+                    });
+                }
+            }
+
+            // 4. Resources
+            for res in &pe.resources {
+                let is_notable = res.type_id == 10 || res.magic_hint.is_some() || res.entropy > 6.5;
+                if is_notable && res.size > 0 && res.file_offset < file_size {
+                    let ext = if res.magic_hint.as_deref() == Some("PE (MZ)") { "exe" } else { "bin" };
+                    let clean_id = res.name_or_id.replace('#', "id_");
+                    targets.push(DumpTarget {
+                        label: format!("Resource {}/{} ({} - ent: {:.2})", res.type_name, res.name_or_id, crate::ui::format_size(res.size as u64), res.entropy),
+                        filename: format!("{}_rsrc_{}_{}.{}", base_name, res.type_name, clean_id, ext),
+                        offset: res.file_offset,
+                        size: res.size,
+                        xor_key: None,
+                    });
+                }
+            }
+        }
+
+        targets
+    }
+
+    pub fn execute_dump(&self, target: &DumpTarget) -> std::result::Result<String, String> {
+        let data = std::fs::read(&self.result.file_info.path).map_err(|e| e.to_string())?;
+        if target.offset >= data.len() {
+            return Err("Offset out of bounds".into());
+        }
+        let end = (target.offset + target.size).min(data.len());
+        let mut payload = data[target.offset..end].to_vec();
+        if let Some(key) = target.xor_key {
+            for b in &mut payload {
+                *b ^= key;
+            }
+        }
+        std::fs::write(&target.filename, &payload).map_err(|e| e.to_string())?;
+        Ok(format!("Dumped {} bytes to {}", payload.len(), target.filename))
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +478,68 @@ mod tests {
         let payload = "hello world";
         let osc = App::format_osc52(payload);
         assert_eq!(osc, "\x1b]52;c;aGVsbG8gd29ybGQ=\x07");
+    }
+
+    #[test]
+    fn test_execute_dump() {
+        let temp_dir = std::env::temp_dir();
+        let src_file = temp_dir.join(format!("test_src_{}.bin", std::process::id()));
+        let out_file = temp_dir.join(format!("test_out_{}.bin", std::process::id()));
+
+        let raw_data = vec![0x10, 0x20, 0x30, 0x40, 0x50];
+        std::fs::write(&src_file, &raw_data).unwrap();
+
+        let app = App::new(crate::models::AnalysisResult {
+            file_info: crate::models::FileInfo {
+                path: src_file.clone(),
+                name: "test.bin".into(),
+                size: raw_data.len() as u64,
+                file_type: crate::models::FileType::Unknown,
+                magic_bytes: vec![],
+            },
+            basic: crate::models::BasicAnalysis {
+                md5: "".into(),
+                sha1: "".into(),
+                sha256: "".into(),
+                entropy: 0.0,
+                strings: vec![],
+                is_packed: false,
+                byte_distribution: vec![0; 256],
+            },
+            pe: None,
+            elf: None,
+            macho: None,
+            risk_score: 0,
+            risk_level: crate::models::RiskLevel::Clean,
+            risk_breakdown: crate::models::RiskBreakdown {
+                entropy_score: 0,
+                api_score: 0,
+                anomaly_score: 0,
+                string_score: 0,
+                packing_score: 0,
+            },
+            detection_checks: vec![],
+            malware_pattern: None,
+            yara_matches: vec![],
+            entropy_graph: vec![],
+        });
+
+        let target = DumpTarget {
+            label: "Test Dump".into(),
+            filename: out_file.to_str().unwrap().into(),
+            offset: 1,
+            size: 3,
+            xor_key: Some(0x20),
+        };
+
+        let result = app.execute_dump(&target);
+        assert!(result.is_ok());
+
+        let dumped = std::fs::read(&out_file).unwrap();
+        // raw_data[1..4] = [0x20, 0x30, 0x40] ^ 0x20 = [0x00, 0x10, 0x60]
+        assert_eq!(dumped, vec![0x00, 0x10, 0x60]);
+
+        let _ = std::fs::remove_file(src_file);
+        let _ = std::fs::remove_file(out_file);
     }
 }

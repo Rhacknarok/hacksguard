@@ -314,7 +314,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         }
     }
 
-    let manifest = if let Some(opt) = pe.header.optional_header {
+    let (resources, manifest) = if let Some(opt) = pe.header.optional_header {
         let file_alignment = opt.windows_fields.file_alignment;
         let dirs = opt.data_directories.data_directories;
         if let Some(Some((_, rsrc_dir))) = dirs.get(2) {
@@ -327,17 +327,60 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
                 &goblin::pe::options::ParseOptions::default(),
             ).unwrap_or(0);
 
-            if offset > 0 && offset + size <= data.len() {
-                find_manifest(&data[offset..offset + size], &pe.sections, file_alignment, data)
+            if offset > 0 && offset < data.len() {
+                let actual_size = size.min(data.len() - offset);
+                parse_resources_and_manifest(&data[offset..offset + actual_size], &pe.sections, file_alignment, data)
             } else {
-                None
+                (Vec::new(), None)
             }
+        } else {
+            (Vec::new(), None)
+        }
+    } else {
+        (Vec::new(), None)
+    };
+
+    let tls_info = if let Some(opt) = pe.header.optional_header {
+        let dirs = opt.data_directories.data_directories;
+        if let Some(Some((_, tls_dir))) = dirs.get(9) {
+            parse_tls_directory(
+                data,
+                tls_dir.virtual_address as usize,
+                tls_dir.size as usize,
+                &pe.sections,
+                opt.windows_fields.file_alignment,
+                image_base,
+                is_64bit,
+            )
         } else {
             None
         }
     } else {
         None
     };
+
+    if let Some(ref tls) = tls_info {
+        if !tls.callbacks.is_empty() {
+            anomalies.push(Anomaly {
+                severity: AnomalySeverity::Warning,
+                description: format!("TLS directory contains {} callback(s) (potential pre-EP execution)", tls.callbacks.len()),
+            });
+        }
+    }
+
+    for res in &resources {
+        if res.magic_hint.as_deref() == Some("PE (MZ)") {
+            anomalies.push(Anomaly {
+                severity: AnomalySeverity::Critical,
+                description: format!("Embedded PE executable in resource {} ({})", res.type_name, res.name_or_id),
+            });
+        } else if res.entropy > 7.2 && res.type_id == 10 {
+            anomalies.push(Anomaly {
+                severity: AnomalySeverity::Warning,
+                description: format!("High-entropy RCDATA resource {} (size {}, entropy {:.2})", res.name_or_id, res.size, res.entropy),
+            });
+        }
+    }
 
     let pdb_path = pe.debug_data.and_then(|debug_data| {
         if let Some(pdb_info) = debug_data.codeview_pdb70_debug_info {
@@ -439,6 +482,8 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         rich_header,
         certificate,
         xor_payloads,
+        tls_info,
+        resources,
     })
 }
 
@@ -960,29 +1005,130 @@ fn iter_rsrc_entries(rsrc: &[u8], dir_offset: usize) -> impl Iterator<Item = (u3
     })
 }
 
-fn find_manifest(
+fn read_rsrc_string(rsrc: &[u8], offset: usize) -> Option<String> {
+    let len = read_u16(rsrc, offset)? as usize;
+    let bytes_start = offset + 2;
+    let bytes_end = bytes_start.checked_add(len.checked_mul(2)?)?;
+    if bytes_end <= rsrc.len() {
+        let u16s: Vec<u16> = rsrc[bytes_start..bytes_end]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&u16s))
+    } else {
+        None
+    }
+}
+
+fn format_resource_type(type_id: u32, name: Option<&str>) -> String {
+    if let Some(n) = name {
+        return n.to_string();
+    }
+    match type_id {
+        1 => "Cursor".into(),
+        2 => "Bitmap".into(),
+        3 => "Icon".into(),
+        4 => "Menu".into(),
+        5 => "Dialog".into(),
+        6 => "StringTable".into(),
+        7 => "FontDir".into(),
+        8 => "Font".into(),
+        9 => "Accelerator".into(),
+        10 => "RCDATA".into(),
+        11 => "MessageTable".into(),
+        12 => "GroupCursor".into(),
+        14 => "GroupIcon".into(),
+        16 => "Version".into(),
+        23 => "HTML".into(),
+        24 => "Manifest".into(),
+        _ => format!("Type_{}", type_id),
+    }
+}
+
+fn detect_magic_hint(data: &[u8]) -> Option<String> {
+    if data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A {
+        Some("PE (MZ)".into())
+    } else if data.len() >= 4 && data[0..4] == [0x7F, b'E', b'L', b'F'] {
+        Some("ELF".into())
+    } else if data.len() >= 4 && (data[0..4] == [0x50, 0x4B, 0x03, 0x04] || data[0..4] == [0x50, 0x4B, 0x05, 0x06]) {
+        Some("ZIP".into())
+    } else if data.len() >= 4 && data[0..4] == [0x4D, 0x53, 0x43, 0x46] {
+        Some("CAB".into())
+    } else if data.len() >= 3 && data[0..3] == [0x1F, 0x8B, 0x08] {
+        Some("GZIP".into())
+    } else {
+        None
+    }
+}
+
+fn parse_resources_and_manifest(
     rsrc_bytes: &[u8],
     sections: &[goblin::pe::section_table::SectionTable],
     file_alignment: u32,
     full_data: &[u8],
-) -> Option<String> {
-    for (type_id, off1) in iter_rsrc_entries(rsrc_bytes, 0) {
-        if type_id == 24 && (off1 & 0x8000_0000) != 0 {
-            for (_, off2) in iter_rsrc_entries(rsrc_bytes, (off1 & 0x7FFF_FFFF) as usize) {
+) -> (Vec<ResourceEntry>, Option<String>) {
+    let mut resources = Vec::new();
+    let mut manifest = None;
+
+    // Level 1: Type
+    for (type_id_raw, off1) in iter_rsrc_entries(rsrc_bytes, 0) {
+        let (type_id, type_name_custom) = if (type_id_raw & 0x8000_0000) != 0 {
+            let str_off = (type_id_raw & 0x7FFF_FFFF) as usize;
+            (type_id_raw, read_rsrc_string(rsrc_bytes, str_off))
+        } else {
+            (type_id_raw, None)
+        };
+        let type_name = format_resource_type(type_id, type_name_custom.as_deref());
+
+        if (off1 & 0x8000_0000) != 0 {
+            let dir2_off = (off1 & 0x7FFF_FFFF) as usize;
+            // Level 2: Name or ID
+            for (name_id_raw, off2) in iter_rsrc_entries(rsrc_bytes, dir2_off) {
+                let name_or_id = if (name_id_raw & 0x8000_0000) != 0 {
+                    let str_off = (name_id_raw & 0x7FFF_FFFF) as usize;
+                    read_rsrc_string(rsrc_bytes, str_off).unwrap_or_else(|| format!("{:#x}", name_id_raw))
+                } else {
+                    format!("#{}", name_id_raw)
+                };
+
                 if (off2 & 0x8000_0000) != 0 {
-                    for (_, data_off) in iter_rsrc_entries(rsrc_bytes, (off2 & 0x7FFF_FFFF) as usize) {
-                        if (data_off & 0x8000_0000) == 0 {
-                            let d_off = data_off as usize;
-                            let rva = read_u32(rsrc_bytes, d_off)? as usize;
-                            let size = read_u32(rsrc_bytes, d_off + 4)? as usize;
-                            let file_offset = goblin::pe::utils::find_offset(
-                                rva,
-                                sections,
-                                file_alignment,
-                                &goblin::pe::options::ParseOptions::default(),
-                            ).unwrap_or(0);
-                            if file_offset > 0 && file_offset + size <= full_data.len() {
-                                return Some(String::from_utf8_lossy(&full_data[file_offset..file_offset + size]).to_string());
+                    let dir3_off = (off2 & 0x7FFF_FFFF) as usize;
+                    // Level 3: Language
+                    for (lang_raw, data_off_raw) in iter_rsrc_entries(rsrc_bytes, dir3_off) {
+                        if (data_off_raw & 0x8000_0000) == 0 {
+                            let leaf_off = data_off_raw as usize;
+                            if let (Some(rva), Some(size)) = (read_u32(rsrc_bytes, leaf_off), read_u32(rsrc_bytes, leaf_off + 4)) {
+                                let rva = rva as usize;
+                                let size = size as usize;
+                                let file_offset = goblin::pe::utils::find_offset(
+                                    rva,
+                                    sections,
+                                    file_alignment,
+                                    &goblin::pe::options::ParseOptions::default(),
+                                ).unwrap_or(0);
+
+                                if file_offset > 0 && file_offset < full_data.len() {
+                                    let end = (file_offset + size).min(full_data.len());
+                                    let actual_slice = &full_data[file_offset..end];
+                                    let entropy = shannon_entropy(actual_slice);
+                                    let magic_hint = detect_magic_hint(actual_slice);
+
+                                    if type_id == 24 && manifest.is_none() {
+                                        manifest = Some(String::from_utf8_lossy(actual_slice).to_string());
+                                    }
+
+                                    resources.push(ResourceEntry {
+                                        type_id,
+                                        type_name: type_name.clone(),
+                                        name_or_id: name_or_id.clone(),
+                                        lang: lang_raw as u16,
+                                        rva: rva as u32,
+                                        file_offset,
+                                        size,
+                                        entropy,
+                                        magic_hint,
+                                    });
+                                }
                             }
                         }
                     }
@@ -990,7 +1136,96 @@ fn find_manifest(
             }
         }
     }
-    None
+
+    (resources, manifest)
+}
+
+fn parse_tls_directory(
+    data: &[u8],
+    tls_rva: usize,
+    tls_size: usize,
+    sections: &[goblin::pe::section_table::SectionTable],
+    file_alignment: u32,
+    image_base: u64,
+    is_64bit: bool,
+) -> Option<TlsInfo> {
+    if tls_rva == 0 || tls_size == 0 {
+        return None;
+    }
+    let tls_offset = goblin::pe::utils::find_offset(
+        tls_rva,
+        sections,
+        file_alignment,
+        &goblin::pe::options::ParseOptions::default(),
+    )?;
+
+    if tls_offset >= data.len() {
+        return None;
+    }
+
+    let (raw_data_start_va, raw_data_end_va, index_va, callbacks_va, zero_fill_size, characteristics) =
+        if is_64bit {
+            if tls_offset + 40 > data.len() {
+                return None;
+            }
+            let start = u64::from_le_bytes(data[tls_offset..tls_offset + 8].try_into().ok()?);
+            let end = u64::from_le_bytes(data[tls_offset + 8..tls_offset + 16].try_into().ok()?);
+            let idx = u64::from_le_bytes(data[tls_offset + 16..tls_offset + 24].try_into().ok()?);
+            let cb = u64::from_le_bytes(data[tls_offset + 24..tls_offset + 32].try_into().ok()?);
+            let zf = u32::from_le_bytes(data[tls_offset + 32..tls_offset + 36].try_into().ok()?);
+            let ch = u32::from_le_bytes(data[tls_offset + 36..tls_offset + 40].try_into().ok()?);
+            (start, end, idx, cb, zf, ch)
+        } else {
+            if tls_offset + 24 > data.len() {
+                return None;
+            }
+            let start = u32::from_le_bytes(data[tls_offset..tls_offset + 4].try_into().ok()?) as u64;
+            let end = u32::from_le_bytes(data[tls_offset + 4..tls_offset + 8].try_into().ok()?) as u64;
+            let idx = u32::from_le_bytes(data[tls_offset + 8..tls_offset + 12].try_into().ok()?) as u64;
+            let cb = u32::from_le_bytes(data[tls_offset + 12..tls_offset + 16].try_into().ok()?) as u64;
+            let zf = u32::from_le_bytes(data[tls_offset + 16..tls_offset + 20].try_into().ok()?);
+            let ch = u32::from_le_bytes(data[tls_offset + 20..tls_offset + 24].try_into().ok()?);
+            (start, end, idx, cb, zf, ch)
+        };
+
+    let mut callbacks = Vec::new();
+    if callbacks_va != 0 && callbacks_va >= image_base {
+        let cb_rva = (callbacks_va - image_base) as usize;
+        if let Some(cb_offset) = goblin::pe::utils::find_offset(
+            cb_rva,
+            sections,
+            file_alignment,
+            &goblin::pe::options::ParseOptions::default(),
+        ) {
+            let mut cur = cb_offset;
+            let ptr_size = if is_64bit { 8 } else { 4 };
+            for _ in 0..128 {
+                if cur + ptr_size > data.len() {
+                    break;
+                }
+                let ptr = if is_64bit {
+                    u64::from_le_bytes(data[cur..cur + 8].try_into().unwrap_or_default())
+                } else {
+                    u32::from_le_bytes(data[cur..cur + 4].try_into().unwrap_or_default()) as u64
+                };
+                if ptr == 0 {
+                    break;
+                }
+                callbacks.push(ptr);
+                cur += ptr_size;
+            }
+        }
+    }
+
+    Some(TlsInfo {
+        raw_data_start_va,
+        raw_data_end_va,
+        index_va,
+        callbacks_va,
+        zero_fill_size,
+        characteristics,
+        callbacks,
+    })
 }
 
 #[cfg(test)]
@@ -1121,5 +1356,125 @@ mod tests {
         let matches = scan_xor_payloads(url, 0, "Overlay");
         // Key 0 is plaintext, must be ignored by XOR brute-forcer
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_detect_magic_hint() {
+        assert_eq!(detect_magic_hint(b"MZ\x90\x00"), Some("PE (MZ)".into()));
+        assert_eq!(detect_magic_hint(b"\x7FELF"), Some("ELF".into()));
+        assert_eq!(detect_magic_hint(b"PK\x03\x04"), Some("ZIP".into()));
+        assert_eq!(detect_magic_hint(b"PK\x05\x06"), Some("ZIP".into()));
+        assert_eq!(detect_magic_hint(b"MSCF"), Some("CAB".into()));
+        assert_eq!(detect_magic_hint(b"\x1F\x8B\x08"), Some("GZIP".into()));
+        assert_eq!(detect_magic_hint(b"plain text data"), None);
+    }
+
+    #[test]
+    fn test_format_resource_type() {
+        assert_eq!(format_resource_type(10, None), "RCDATA");
+        assert_eq!(format_resource_type(24, None), "Manifest");
+        assert_eq!(format_resource_type(3, None), "Icon");
+        assert_eq!(format_resource_type(999, None), "Type_999");
+        assert_eq!(format_resource_type(10, Some("CUSTOM")), "CUSTOM");
+    }
+
+    #[test]
+    fn test_parse_resources_and_manifest() {
+        // Build synthetic 3-level .rsrc directory table
+        let mut rsrc = vec![0u8; 128];
+        // Level 1: Root directory at 0. 1 ID entry.
+        rsrc[14..16].copy_from_slice(&1u16.to_le_bytes()); // NumberOfIdEntries = 1
+        rsrc[16..20].copy_from_slice(&10u32.to_le_bytes()); // Type = 10 (RCDATA)
+        rsrc[20..24].copy_from_slice(&(0x8000_0000 | 0x20u32).to_le_bytes()); // Subdirectory at 0x20
+
+        // Level 2: Type directory at 0x20. 1 ID entry.
+        rsrc[0x20 + 14..0x20 + 16].copy_from_slice(&1u16.to_le_bytes());
+        rsrc[0x20 + 16..0x20 + 20].copy_from_slice(&1u32.to_le_bytes()); // Name ID = 1
+        rsrc[0x20 + 20..0x20 + 24].copy_from_slice(&(0x8000_0000 | 0x40u32).to_le_bytes()); // Subdirectory at 0x40
+
+        // Level 3: Name directory at 0x40. 1 ID entry (Lang).
+        rsrc[0x40 + 14..0x40 + 16].copy_from_slice(&1u16.to_le_bytes());
+        rsrc[0x40 + 16..0x40 + 20].copy_from_slice(&1033u32.to_le_bytes()); // Lang = 1033
+        rsrc[0x40 + 20..0x40 + 24].copy_from_slice(&0x60u32.to_le_bytes()); // Data entry at 0x60
+
+        // Leaf Data entry at 0x60
+        rsrc[0x60..0x64].copy_from_slice(&0x1000u32.to_le_bytes()); // RVA = 0x1000
+        rsrc[0x64..0x68].copy_from_slice(&16u32.to_le_bytes()); // Size = 16
+
+        // Section table mapping RVA 0x1000 to file offset 0x200
+        let sec = goblin::pe::section_table::SectionTable {
+            virtual_address: 0x1000,
+            virtual_size: 0x1000,
+            pointer_to_raw_data: 0x200,
+            size_of_raw_data: 0x1000,
+            ..Default::default()
+        };
+
+        // Full binary data with embedded MZ header at 0x200
+        let mut full_data = vec![0u8; 0x1000];
+        full_data[0x200] = b'M';
+        full_data[0x201] = b'Z';
+        full_data[0x202..0x210].copy_from_slice(&[0x90; 14]);
+
+        let (resources, manifest) = parse_resources_and_manifest(&rsrc, &[sec], 0x200, &full_data);
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].type_id, 10);
+        assert_eq!(resources[0].type_name, "RCDATA");
+        assert_eq!(resources[0].name_or_id, "#1");
+        assert_eq!(resources[0].lang, 1033);
+        assert_eq!(resources[0].rva, 0x1000);
+        assert_eq!(resources[0].file_offset, 0x200);
+        assert_eq!(resources[0].size, 16);
+        assert_eq!(resources[0].magic_hint, Some("PE (MZ)".to_string()));
+        assert!(manifest.is_none());
+    }
+
+    #[test]
+    fn test_parse_tls_directory() {
+        let sec = goblin::pe::section_table::SectionTable {
+            virtual_address: 0x2000,
+            virtual_size: 0x1000,
+            pointer_to_raw_data: 0x400,
+            size_of_raw_data: 0x1000,
+            ..Default::default()
+        };
+
+        let image_base = 0x140000000u64;
+        let mut data = vec![0u8; 0x2000];
+
+        // TLS directory 64-bit at offset 0x400:
+        // raw_data_start_va (u64): 0x140003000
+        // raw_data_end_va (u64): 0x140003100
+        // index_va (u64): 0x140002800
+        // callbacks_va (u64): 0x140002500 (RVA 0x2500 -> file offset 0x900)
+        // zero_fill_size (u32): 0x10
+        // characteristics (u32): 0x0
+        data[0x400..0x408].copy_from_slice(&0x140003000u64.to_le_bytes());
+        data[0x408..0x410].copy_from_slice(&0x140003100u64.to_le_bytes());
+        data[0x410..0x418].copy_from_slice(&0x140002800u64.to_le_bytes());
+        data[0x418..0x420].copy_from_slice(&0x140002500u64.to_le_bytes());
+        data[0x420..0x424].copy_from_slice(&0x10u32.to_le_bytes());
+        data[0x424..0x428].copy_from_slice(&0u32.to_le_bytes());
+
+        // Callbacks array at RVA 0x2500 (offset 0x400 + 0x500 = 0x900)
+        // Callback 1: 0x140001050
+        // Callback 2: 0x140001080
+        // Terminator: 0x0
+        data[0x900..0x908].copy_from_slice(&0x140001050u64.to_le_bytes());
+        data[0x908..0x910].copy_from_slice(&0x140001080u64.to_le_bytes());
+        data[0x910..0x918].copy_from_slice(&0u64.to_le_bytes());
+
+        let tls_opt = parse_tls_directory(&data, 0x2000, 40, &[sec], 0x200, image_base, true);
+        assert!(tls_opt.is_some());
+        let tls = tls_opt.unwrap();
+        assert_eq!(tls.raw_data_start_va, 0x140003000);
+        assert_eq!(tls.raw_data_end_va, 0x140003100);
+        assert_eq!(tls.index_va, 0x140002800);
+        assert_eq!(tls.callbacks_va, 0x140002500);
+        assert_eq!(tls.zero_fill_size, 0x10);
+        assert_eq!(tls.callbacks.len(), 2);
+        assert_eq!(tls.callbacks[0], 0x140001050);
+        assert_eq!(tls.callbacks[1], 0x140001080);
     }
 }

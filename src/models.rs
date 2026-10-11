@@ -165,6 +165,32 @@ pub struct PeAnalysis {
     pub rich_header: Option<RichHeaderInfo>,
     pub certificate: Option<CertificateInfo>,
     pub xor_payloads: Vec<XorPayloadMatch>,
+    pub tls_info: Option<TlsInfo>,
+    pub resources: Vec<ResourceEntry>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct TlsInfo {
+    pub raw_data_start_va: u64,
+    pub raw_data_end_va: u64,
+    pub index_va: u64,
+    pub callbacks_va: u64,
+    pub zero_fill_size: u32,
+    pub characteristics: u32,
+    pub callbacks: Vec<u64>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResourceEntry {
+    pub type_id: u32,
+    pub type_name: String,
+    pub name_or_id: String,
+    pub lang: u16,
+    pub rva: u32,
+    pub file_offset: usize,
+    pub size: usize,
+    pub entropy: f64,
+    pub magic_hint: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

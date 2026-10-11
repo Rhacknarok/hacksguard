@@ -4,7 +4,7 @@ use crate::theme;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter, Instruction};
 
@@ -63,6 +63,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 draw_macho_imports(frame, chunks[2], app);
             }
         }
+        "Resources" => {
+            if app.current_pe().is_some() {
+                draw_resources(frame, chunks[2], app);
+            }
+        }
         "Manifest" => draw_manifest(frame, chunks[2], app),
         "Entropy" => draw_entropy(frame, chunks[2], app),
         "Disasm" => {
@@ -81,6 +86,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     draw_status_bar(frame, chunks[3], app);
+
+    if app.show_dump_modal {
+        draw_dump_modal(frame, app);
+    }
 }
 
 // ─── Title bar ───────────────────────────────────────────────────
@@ -190,6 +199,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         if app.result.pe.as_ref().is_some_and(|pe| pe.embedded_pe.is_some()) {
             spans.push(Span::styled("e ", Style::default().fg(theme::ORANGE)));
             spans.push(Span::styled("Toggle PE  ", Style::default().fg(theme::TEXT_DIM)));
+        }
+
+        if !app.get_dump_targets().is_empty() {
+            spans.push(Span::styled("d ", Style::default().fg(theme::ORANGE)));
+            spans.push(Span::styled("Dump  ", Style::default().fg(theme::TEXT_DIM)));
         }
 
         spans.push(Span::styled("q ", Style::default().fg(theme::ORANGE)));
@@ -1152,6 +1166,37 @@ fn draw_headers(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
+    if let Some(tls) = &pe.tls_info {
+        left_lines.push(Line::from(""));
+        let tls_header = if !tls.callbacks.is_empty() {
+            "TLS Directory (⚠ Callbacks Present)"
+        } else {
+            "TLS Directory"
+        };
+        left_lines.push(section_header(tls_header));
+        left_lines.push(kv_line("Raw Data VA", &format!("{:#010x}..{:#010x}", tls.raw_data_start_va, tls.raw_data_end_va)));
+        left_lines.push(kv_line("Index VA", &format!("{:#010x}", tls.index_va)));
+        left_lines.push(kv_line("Callbacks VA", &format!("{:#010x}", tls.callbacks_va)));
+        left_lines.push(kv_line("ZeroFill Size", &format!("{:#x}", tls.zero_fill_size)));
+        left_lines.push(kv_line("Characteristics", &format!("{:#x}", tls.characteristics)));
+        if tls.callbacks.is_empty() {
+            left_lines.push(Line::from(vec![
+                Span::styled("  Callbacks: ", theme::label()),
+                Span::styled("None", theme::value()),
+            ]));
+        } else {
+            left_lines.push(Line::from(vec![
+                Span::styled(format!("  Callbacks ({}) - ⚠ Executes before EntryPoint:", tls.callbacks.len()), Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
+            ]));
+            for cb in &tls.callbacks {
+                left_lines.push(Line::from(vec![
+                    Span::styled("   ⚡ Callback VA: ", Style::default().fg(theme::WARNING)),
+                    Span::styled(format!("{:#010x}", cb), Style::default().fg(theme::CRITICAL).add_modifier(Modifier::BOLD)),
+                ]));
+            }
+        }
+    }
+
     // Center Column: Optional Header & Exports
     let ep_str = match &pe.entry_point_section {
         Some(sec) => format!("{:#010x} ({})", pe.entry_point, sec),
@@ -1700,7 +1745,7 @@ fn section_header(text: &str) -> Line<'static> {
     )])
 }
 
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
@@ -2161,6 +2206,159 @@ fn draw_manifest(frame: &mut Frame, area: Rect, app: &App) {
             .scroll((app.scroll_offset, 0)),
         inner_area,
     );
+}
+
+fn draw_resources(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(pe) = app.current_pe() else {
+        frame.render_widget(Paragraph::new(" No PE resources"), area);
+        return;
+    };
+
+    let header = Row::new(vec![
+        Cell::from("Type").style(theme::header()),
+        Cell::from("Name/ID").style(theme::header()),
+        Cell::from("Lang").style(theme::header()),
+        Cell::from("Offset").style(theme::header()),
+        Cell::from("Size").style(theme::header()),
+        Cell::from("Entropy").style(theme::header()),
+        Cell::from("Magic / Content").style(theme::header()),
+        Cell::from("Status").style(theme::header()),
+    ])
+    .height(1);
+
+    let query_lower = app.search_query.to_lowercase();
+    let rows: Vec<Row> = pe
+        .resources
+        .iter()
+        .filter(|r| {
+            query_lower.is_empty()
+                || r.type_name.to_lowercase().contains(&query_lower)
+                || r.name_or_id.to_lowercase().contains(&query_lower)
+                || r.magic_hint.as_deref().unwrap_or("").to_lowercase().contains(&query_lower)
+        })
+        .map(|r| {
+            let ent_color = if r.entropy > 7.2 {
+                theme::CRITICAL
+            } else if r.entropy > 6.5 {
+                theme::WARNING
+            } else {
+                theme::SAFE
+            };
+
+            let magic_str = r.magic_hint.clone().unwrap_or_else(|| "—".to_string());
+            let is_embedded_pe = r.magic_hint.as_deref() == Some("PE (MZ)");
+            let is_high_rcdata = r.type_id == 10 && r.entropy > 7.2;
+            let (status_str, status_color) = if is_embedded_pe {
+                ("⚠ Embedded PE", theme::CRITICAL)
+            } else if is_high_rcdata {
+                ("⚠ High-Entropy RCDATA", theme::CRITICAL)
+            } else if r.entropy > 7.5 {
+                ("⚠ High Entropy", theme::WARNING)
+            } else {
+                ("Normal", theme::TEXT_DIM)
+            };
+
+            Row::new(vec![
+                Cell::from(r.type_name.clone()).style(theme::value()),
+                Cell::from(r.name_or_id.clone()).style(theme::value()),
+                Cell::from(format!("{:#06x}", r.lang)).style(theme::label()),
+                Cell::from(format!("{:#010x}", r.file_offset)).style(theme::value()),
+                Cell::from(format!("{} ({:#x})", format_size(r.size as u64), r.size)).style(theme::value()),
+                Cell::from(format!("{:.2}", r.entropy)).style(Style::default().fg(ent_color).add_modifier(Modifier::BOLD)),
+                Cell::from(magic_str).style(Style::default().fg(if is_embedded_pe { theme::CRITICAL } else { theme::TEXT })),
+                Cell::from(status_str).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(18),
+        Constraint::Length(14),
+        Constraint::Length(10),
+        Constraint::Length(12),
+        Constraint::Length(18),
+        Constraint::Length(10),
+        Constraint::Length(22),
+        Constraint::Min(16),
+    ];
+
+    let total_rows = rows.len();
+    let skip = (app.scroll_offset as usize).min(total_rows);
+    let title = format!("PE Resources ({} total)", total_rows);
+
+    let table = Table::new(rows.into_iter().skip(skip).collect::<Vec<_>>(), widths)
+        .header(header)
+        .block(panel_block(&title))
+        .row_highlight_style(Style::default().bg(theme::BG_PANEL));
+
+    frame.render_widget(table, area);
+}
+
+fn draw_dump_modal(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let width = 86.min(area.width.saturating_sub(4));
+    let num_targets = app.dump_targets.len();
+    let height = ((num_targets as u16) + 6).min(area.height.saturating_sub(4)).max(8);
+
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Payload Carving & Extraction ")
+        .title_style(Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(theme::ORANGE))
+        .style(Style::default().bg(theme::BG_PANEL));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Select payload to carve to disk (saved in current directory):", Style::default().fg(theme::TEXT_DIM)),
+    ]));
+    lines.push(Line::from(""));
+
+    if app.dump_targets.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  No carvable payloads detected in current binary.", Style::default().fg(theme::TEXT_DIM)),
+        ]));
+    } else {
+        for (idx, target) in app.dump_targets.iter().enumerate() {
+            let is_selected = idx == app.dump_selected_idx;
+            if is_selected {
+                lines.push(Line::from(vec![
+                    Span::styled(" ▶ ", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)),
+                    Span::styled(&target.label, Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" -> {}", target.filename), Style::default().fg(theme::SAFE)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("   ", Style::default().fg(theme::TEXT)),
+                    Span::styled(&target.label, Style::default().fg(theme::TEXT)),
+                    Span::styled(format!(" -> {}", target.filename), Style::default().fg(theme::TEXT_DIM)),
+                ]));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[↑/k / ↓/j] ", Style::default().fg(theme::ORANGE)),
+        Span::styled("Select   ", Style::default().fg(theme::TEXT_DIM)),
+        Span::styled("[Enter] ", Style::default().fg(theme::SAFE)),
+        Span::styled("Carve & Save   ", Style::default().fg(theme::TEXT_DIM)),
+        Span::styled("[Esc] ", Style::default().fg(theme::CRITICAL)),
+        Span::styled("Cancel", Style::default().fg(theme::TEXT_DIM)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ─── ELF Tabs ────────────────────────────────────────────────────

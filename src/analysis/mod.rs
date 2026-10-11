@@ -636,6 +636,11 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
     });
     check("Self-signed Authenticode Certificate", self_signed_cert, DetectionSeverity::Critical);
     check("1-byte XOR Encrypted Payload", pe.as_ref().is_some_and(|p| !p.xor_payloads.is_empty()), DetectionSeverity::Critical);
+    check("TLS Callbacks detected (Pre-EP execution)", pe.as_ref().is_some_and(|p| p.tls_info.as_ref().is_some_and(|t| !t.callbacks.is_empty())), DetectionSeverity::High);
+    let has_suspicious_resource = pe.as_ref().is_some_and(|p| {
+        p.resources.iter().any(|r| r.magic_hint.as_deref() == Some("PE (MZ)") || (r.entropy > 7.2 && r.type_id == 10))
+    });
+    check("Suspicious resource (Embedded PE / high-entropy RCDATA)", has_suspicious_resource, DetectionSeverity::High);
 
     // ─── ELF-Specific Detection Checks ───
     if let Some(elf) = elf {

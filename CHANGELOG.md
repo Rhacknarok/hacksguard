@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **PE TLS Callbacks Forensics (`IMAGE_DIRECTORY_ENTRY_TLS`)**:
+  - Implemented 32-bit and 64-bit Thread Local Storage (TLS) directory parsing (`src/analysis/pe.rs`) with absolute Virtual Address (`VA`) to RVA resolution for callback arrays.
+  - Enumerates TLS callbacks executed before binary `AddressOfEntryPoint` (`Pre-EP execution`), triggering critical anomaly flags.
+  - Integrated TLS Directory inspection (Start/End VA, Index VA, Callbacks VA, and Callback list) in PE Headers view.
+- **PE Resource Directory (`.rsrc`) 3-Level Tree Parser**:
+  - Implemented full 3-level tree traversal (`Type -> Name/ID -> Language`) with UTF-16 resource string decoding and standard Win32 type mapping (`RT_ICON`, `RT_RCDATA`, `RT_MANIFEST`, etc.).
+  - Added Shannon entropy calculation per resource node and magic byte hint detection (`PE (MZ)`, `ELF`, `ZIP`, `CAB`, `GZIP`).
+  - Added dedicated interactive `Resources` TUI tab with real-time filtering (`/`), entropy threshold warnings, and suspicious resource flagging (embedded PE executables, high-entropy RCDATA payloads).
+- **Payload Carving Engine (`d`)**:
+  - Added binary payload carving engine (`src/app.rs`) with interactive modal selection (`d` key) and direct-to-disk extraction.
+  - Supports carving unauthenticated overlay data, brute-force decrypted XOR payloads, embedded PE executables, and suspicious high-entropy `.rsrc` entries.
+
 ### Changed
 - **Relicensed to PolyForm Noncommercial License 1.0.0**:
   - Relicensed Hacksguard core engine from MIT to PolyForm Noncommercial 1.0.0 (`PolyForm-Noncommercial-1.0.0`), prohibiting commercial exploitation, paid service wrapping, and proprietary product integration while preserving free access for personal, academic, research, and open-source purposes.
