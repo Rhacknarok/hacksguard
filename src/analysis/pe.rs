@@ -473,6 +473,7 @@ pub fn analyze(data: &[u8]) -> Result<PeAnalysis> {
         embedded_pe: None,
         peb_walking: false,
         api_hashing: false,
+        resolved_apis: Vec::new(),
         pdb_path,
         manifest,
         direct_syscalls: false,

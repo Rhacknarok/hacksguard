@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Structured Network IOC Extraction**:
+  - Extracts bare domains, IPv4/IPv6 addresses, ports, and HTTP paths from plain and Base64-decoded strings.
+  - Preserves raw string evidence, offsets, encoding indicators, and decoded content while exposing structured `host`, `port`, and `path` fields in JSON reports.
+  - Rejects common file extensions, versions, and file paths to reduce false positives, and restricts bare domains to common TLDs unless network context is present.
+  - Added a dedicated `d` domain filter in the Strings view and integrated bare domains into endpoint-based detection.
+- **Hashed API Resolution**:
+  - Resolves common Windows API names hashed with ROR13-add, ROL7-XOR, FNV-1a, DJB2, and CRC32.
+  - Includes resolved APIs in import-based detection checks and displays them in the analysis interface.
 - **PE TLS Callbacks Forensics (`IMAGE_DIRECTORY_ENTRY_TLS`)**:
   - Implemented 32-bit and 64-bit Thread Local Storage (TLS) directory parsing (`src/analysis/pe.rs`) with absolute Virtual Address (`VA`) to RVA resolution for callback arrays.
   - Enumerates TLS callbacks executed before binary `AddressOfEntryPoint` (`Pre-EP execution`), triggering critical anomaly flags.
@@ -21,9 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Supports carving unauthenticated overlay data, brute-force decrypted XOR payloads, embedded PE executables, and suspicious high-entropy `.rsrc` entries.
 
 ### Changed
+- **Evidence-Based C2 Classification**:
+  - Requires correlated evasive-loader behavior, suspicious imports, network APIs, and endpoint evidence before classifying a sample as `Trojan.C2Agent`.
+  - Samples without endpoint evidence are classified as `Loader.Evasive` instead of producing unsupported C2 verdicts.
+  - Expanded downloader detection to accept bare-domain endpoints.
 - **Relicensed to PolyForm Noncommercial License 1.0.0**:
   - Relicensed Hacksguard core engine from MIT to PolyForm Noncommercial 1.0.0 (`PolyForm-Noncommercial-1.0.0`), prohibiting commercial exploitation, paid service wrapping, and proprietary product integration while preserving free access for personal, academic, research, and open-source purposes.
   - Documented third-party submodule licensing compliance in [`LICENSE.md`](LICENSE.md) and [`README.md`](README.md) (`rules/elastic` under Elastic License 2.0, `rules/signature-base` under DRL 1.1).
+
+### Fixed
+- **YARA External Symbols and Error Reporting**:
+  - Declares `filename`, `filepath`, `extension`, `filetype`, `md5`, and `owner` so all bundled rules compile successfully.
+  - Collects and displays compilation and scan errors instead of hiding partial YARA results.
+  - Prevents caching incomplete rulesets and updates the cache fingerprint format.
+- **Malformed Binary Handling**:
+  - Propagates PE, ELF, and Mach-O parsing failures instead of silently treating malformed files as unsupported formats.
+  - Restores the terminal correctly when analysis fails.
 
 ## [0.4.0] - 2026-09-09
 

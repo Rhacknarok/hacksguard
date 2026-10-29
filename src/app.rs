@@ -20,7 +20,7 @@ pub struct App {
     pub scroll_offset: u16,
     pub should_quit: bool,
     pub tab_names: Vec<String>,
-    pub yara_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    pub yara_rx: Option<std::sync::mpsc::Receiver<(Vec<String>, Vec<String>)>>,
     pub yara_loading: bool,
     pub embedded_pe_rx: Option<std::sync::mpsc::Receiver<Option<crate::models::PeAnalysis>>>,
     pub embedded_pe_loading: bool,
@@ -67,9 +67,10 @@ impl App {
             if self.yara_loading {
                 tick = true;
                 if let Some(ref rx) = self.yara_rx {
-                    if let Ok(matches) = rx.try_recv() {
+                    if let Ok((matches, errors)) = rx.try_recv() {
                         self.yara_loading = false;
                         self.result.yara_matches = matches;
+                        self.result.yara_errors = errors;
                         
                         // Recompute risk score and level dynamically
                         let (score, level) = crate::analysis::compute_risk_from_checks(
@@ -160,6 +161,7 @@ impl App {
                     if self.current_tab_name() == "Strings" {
                         let toggled = match key.code {
                             KeyCode::Char('u') => Some(crate::models::StringCategory::Url),
+                            KeyCode::Char('d') => Some(crate::models::StringCategory::Domain),
                             KeyCode::Char('i') => Some(crate::models::StringCategory::IpAddress),
                             KeyCode::Char('r') => Some(crate::models::StringCategory::RegistryKey),
                             KeyCode::Char('c') => Some(crate::models::StringCategory::Command),
@@ -542,6 +544,7 @@ mod tests {
             detection_checks: vec![],
             malware_pattern: None,
             yara_matches: vec![],
+            yara_errors: vec![],
             entropy_graph: vec![],
         });
 
@@ -606,6 +609,7 @@ mod tests {
             detection_checks: vec![],
             malware_pattern: None,
             yara_matches: vec![],
+            yara_errors: vec![],
             entropy_graph: vec![],
         });
 

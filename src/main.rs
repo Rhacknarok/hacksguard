@@ -59,7 +59,13 @@ fn main() -> Result<()> {
         }
 
         if let Ok(res) = rx.try_recv() {
-            break res?;
+            match res {
+                Ok(result) => break result,
+                Err(err) => {
+                    ratatui::restore();
+                    return Err(err);
+                }
+            }
         }
 
         terminal.draw(|f| {

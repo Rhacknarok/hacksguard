@@ -28,7 +28,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
     };
 
     let data_ref = &data;
-    let (basic_result, entropy_graph, pe_result, elf_result, macho_result, yara_matches) = std::thread::scope(|s| {
+    let (basic_result, entropy_graph, pe_result, elf_result, macho_result, yara_matches, yara_errors) = std::thread::scope(|s| -> Result<_> {
         let tx1 = progress_tx.clone();
         let basic_handle = s.spawn(move || {
             let res = basic::analyze(data_ref);
@@ -45,14 +45,14 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
         let tx3 = progress_tx.clone();
         let binary_handle = s.spawn(move || {
-            let (pe, elf, macho) = match file_type {
-                FileType::PE => (pe::analyze(data_ref).ok(), None, None),
-                FileType::ELF => (None, elf::analyze(data_ref).ok(), None),
-                FileType::MachO => (None, None, macho::analyze(data_ref).ok()),
-                _ => (None, None, None),
+            let parsed = match file_type {
+                FileType::PE => pe::analyze(data_ref).map(|pe| (Some(pe), None, None)),
+                FileType::ELF => elf::analyze(data_ref).map(|elf| (None, Some(elf), None)),
+                FileType::MachO => macho::analyze(data_ref).map(|macho| (None, None, Some(macho))),
+                _ => Ok((None, None, None)),
             };
             if let Some(tx) = &tx3 { let _ = tx.send(()); }
-            (pe, elf, macho)
+            parsed
         });
 
         let yara_handle = if run_yara {
@@ -68,15 +68,15 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
 
         let basic = basic_handle.join().unwrap();
         let entropy = entropy_handle.join().unwrap();
-        let (pe, elf, macho) = binary_handle.join().unwrap();
-        let yara = if let Some(h) = yara_handle {
+        let (pe, elf, macho) = binary_handle.join().unwrap()?;
+        let (yara_matches, yara_errors) = if let Some(h) = yara_handle {
             h.join().unwrap()
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
-        (basic, entropy, pe, elf, macho, yara)
-    });
+        Ok((basic, entropy, pe, elf, macho, yara_matches, yara_errors))
+    })?;
 
     let mut pe_result = pe_result;
     if let Some(ref mut pe) = pe_result {
@@ -92,6 +92,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         let mut direct_syscalls = false;
         let mut indirect_syscalls = false;
         let mut syscall_locations = Vec::new();
+        let mut resolved_apis = Vec::new();
 
         let bitness = if pe.is_64bit { 64 } else { 32 };
 
@@ -102,6 +103,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
                 if start < end {
                     let section_data = &data[start..end];
                     let (sec_peb, sec_hashing, sec_direct, sec_indirect, sec_locations) = scan_peb_and_hashing(bitness, section_data, section.virtual_address);
+                    resolved_apis.extend(resolve_hashed_apis(section_data));
                     if sec_peb {
                         peb_walking = true;
                     }
@@ -119,8 +121,11 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
             }
         }
 
+        resolved_apis.sort();
+        resolved_apis.dedup();
         pe.peb_walking = peb_walking;
         pe.api_hashing = api_hashing;
+        pe.resolved_apis = resolved_apis;
         pe.direct_syscalls = direct_syscalls;
         pe.indirect_syscalls = indirect_syscalls;
         pe.syscall_locations = syscall_locations;
@@ -171,6 +176,7 @@ pub fn analyze_file(path: &Path, progress_tx: Option<std::sync::mpsc::Sender<()>
         detection_checks,
         malware_pattern,
         yara_matches,
+        yara_errors,
         entropy_graph,
     })
 }
@@ -246,6 +252,7 @@ fn compute_rules_fingerprint(rules_dir: &std::path::Path) -> Vec<u8> {
     use sha2::{Sha256, Digest};
 
     let mut hasher = Sha256::new();
+    hasher.update(b"hacksguard-yara-cache-v2");
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
     visit_dirs(rules_dir, &mut paths);
@@ -269,7 +276,7 @@ fn compute_rules_fingerprint(rules_dir: &std::path::Path) -> Vec<u8> {
 /// Load a cached YARA Scanner from disk, or compile from source rules and cache.
 ///
 /// Cache format: [32 bytes fingerprint][boreal-serialized Scanner]
-pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
+pub fn load_or_compile_yara(data: &[u8]) -> (Vec<String>, Vec<String>) {
     let rules_dir = resolve_app_path("rules");
     let cache_path = resolve_cache_path();
     let fingerprint = compute_rules_fingerprint(&rules_dir);
@@ -279,28 +286,25 @@ pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
         if cache_bytes.len() > 32 && cache_bytes[..32] == fingerprint[..] {
             let params = boreal::scanner::DeserializeParams::default();
             if let Ok(scanner) = boreal::scanner::Scanner::from_bytes_unchecked(&cache_bytes[32..], params) {
-                let res = match scanner.scan_mem(data) {
-                    Ok(res) => res,
-                    Err((_, res)) => res,
+                let (res, scan_error) = match scanner.scan_mem(data) {
+                    Ok(res) => (res, None),
+                    Err((error, res)) => (res, Some(format!("YARA scan error: {}", error))),
                 };
-                return res.rules.iter().map(|r| r.name.to_string()).collect();
+                let matches = res.rules.iter().map(|r| r.name.to_string()).collect();
+                return (matches, scan_error.into_iter().collect());
             }
         }
     }
 
     // Cache miss or invalid → recompile
-    let mut compiler = boreal::Compiler::new();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     visit_dirs(&rules_dir, &mut paths);
     paths.sort();
-    for path in &paths {
-        let _ = compiler.add_rules_file(path);
-    }
-    let scanner = compiler.finalize();
+    let (scanner, mut errors) = compile_yara_rules(&paths);
 
-    // Save cache
+    // Partial rulesets are not cached, so compilation errors stay visible.
     let mut serialized = Vec::new();
-    if scanner.to_bytes(&mut serialized).is_ok() {
+    if errors.is_empty() && scanner.to_bytes(&mut serialized).is_ok() {
         let mut cache = Vec::with_capacity(32 + serialized.len());
         cache.extend_from_slice(&fingerprint);
         cache.extend_from_slice(&serialized);
@@ -309,9 +313,27 @@ pub fn load_or_compile_yara(data: &[u8]) -> Vec<String> {
 
     let res = match scanner.scan_mem(data) {
         Ok(res) => res,
-        Err((_, res)) => res,
+        Err((error, res)) => {
+            errors.push(format!("YARA scan error: {}", error));
+            res
+        }
     };
-    res.rules.iter().map(|r| r.name.to_string()).collect()
+    let matches = res.rules.iter().map(|r| r.name.to_string()).collect();
+    (matches, errors)
+}
+
+fn compile_yara_rules(paths: &[std::path::PathBuf]) -> (boreal::scanner::Scanner, Vec<String>) {
+    let mut compiler = boreal::Compiler::new();
+    for name in ["filename", "filepath", "extension", "filetype", "md5", "owner"] {
+        compiler.define_symbol(name, "");
+    }
+    let mut errors = Vec::new();
+    for path in paths {
+        if let Err(error) = compiler.add_rules_file(path) {
+            errors.push(format!("{}: {}", path.display(), error));
+        }
+    }
+    (compiler.finalize(), errors)
 }
 
 fn detect_type(magic: &[u8]) -> FileType {
@@ -453,6 +475,8 @@ fn has_imported_api(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, macho: &
             dll.functions.iter().any(|f| {
                 names.iter().any(|n| f.name.eq_ignore_ascii_case(n))
             })
+        }) || pe.resolved_apis.iter().any(|api| {
+            names.iter().any(|name| api.eq_ignore_ascii_case(name))
         }) {
             return true;
         }
@@ -480,7 +504,7 @@ fn has_all_imported_apis(pe: &Option<PeAnalysis>, elf: &Option<ElfAnalysis>, mac
         names.iter().all(|name| {
             pe.imports.iter().any(|dll| {
                 dll.functions.iter().any(|f| f.name.eq_ignore_ascii_case(name))
-            })
+            }) || pe.resolved_apis.iter().any(|api| api.eq_ignore_ascii_case(name))
         })
     } else if let Some(elf) = elf {
         names.iter().all(|name| {
@@ -517,12 +541,13 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
     let has_api = |names: &[&str]| has_imported_api(pe, elf, macho, names);
     let has_all_apis = |names: &[&str]| has_all_imported_apis(pe, elf, macho, names);
 
-    // 1-9. Basic string & entropy checks
+    // 1-10. Basic string & entropy checks
     check("High entropy (>7.0)", basic.entropy > 7.0, DetectionSeverity::High);
     check("Very high entropy (>7.5)", basic.entropy > 7.5, DetectionSeverity::High);
     check("Packed binary", basic.is_packed, DetectionSeverity::High);
     check("Suspicious strings found", has_non_normal, DetectionSeverity::Low);
     check("URLs in strings", has_category(&StringCategory::Url), DetectionSeverity::Medium);
+    check("Domains in strings", has_category(&StringCategory::Domain), DetectionSeverity::Medium);
     check("IP addresses in strings", has_category(&StringCategory::IpAddress), DetectionSeverity::Medium);
     check("Commands in strings", has_category(&StringCategory::Command), DetectionSeverity::Medium);
     check("Registry keys in strings", has_category(&StringCategory::RegistryKey), DetectionSeverity::Low);
@@ -549,13 +574,26 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
         "InternetOpenW",
         "InternetOpenUrlA",
         "InternetOpenUrlW",
+        "InternetConnectA",
+        "InternetConnectW",
         "WSAStartup",
+        "socket",
+        "connect",
         "HttpOpenRequestA",
         "HttpOpenRequestW",
+        "WinHttpConnect",
+        "WinHttpOpenRequest",
+        "WinHttpSendRequest",
         "URLDownloadToFileA",
         "URLDownloadToFileW",
     ]);
     check("Network APIs", network_apis, DetectionSeverity::Medium);
+    let has_endpoint = has_category(&StringCategory::Url)
+        || has_category(&StringCategory::Domain)
+        || has_category(&StringCategory::IpAddress)
+        || pe.as_ref().is_some_and(|p| {
+            p.xor_payloads.iter().any(|payload| payload.description == "XOR-encoded URL")
+        });
 
     let crypto_apis = has_api(&[
         "CryptEncrypt",
@@ -640,12 +678,17 @@ fn build_detection_checks(basic: &BasicAnalysis, pe: &Option<PeAnalysis>, elf: &
     check("Direct Syscalls Detected", pe.as_ref().is_some_and(|p| p.direct_syscalls), DetectionSeverity::Critical);
     check("Indirect Syscalls Detected", pe.as_ref().is_some_and(|p| p.indirect_syscalls), DetectionSeverity::Critical);
 
-    let stealth_c2 = pe.as_ref().is_some_and(|p| {
+    let evasive_loader = pe.as_ref().is_some_and(|p| {
         let has_evasive_calls = p.api_hashing || p.peb_walking || p.direct_syscalls || p.indirect_syscalls;
         let total_imports: usize = p.imports.iter().map(|dll| dll.functions.len()).sum();
         has_evasive_calls && (total_imports <= 35 || p.imports.len() <= 3)
     });
-    check("Stealth C2 Agent Profile (Evasive Loading + Sparse IAT)", stealth_c2, DetectionSeverity::Critical);
+    check("Evasive Loader Profile (Evasive Loading + Sparse IAT)", evasive_loader, DetectionSeverity::High);
+    check(
+        "C2 Agent Profile (Evasive Loading + Network + Endpoint)",
+        evasive_loader && network_apis && has_endpoint,
+        DetectionSeverity::Critical,
+    );
 
     let self_signed_cert = pe.as_ref().is_some_and(|p| {
         p.certificate.as_ref().is_some_and(|c| c.is_self_signed)
@@ -706,6 +749,10 @@ fn detect_malware_pattern(
         basic.strings.iter().any(|s| {
             let lower = s.value.to_lowercase();
             needles.iter().any(|n| lower.contains(n))
+                || s.decoded.as_ref().is_some_and(|decoded| {
+                    let lower = decoded.to_lowercase();
+                    needles.iter().any(|n| lower.contains(n))
+                })
         })
     };
 
@@ -714,9 +761,14 @@ fn detect_malware_pattern(
         "InternetOpenW",
         "InternetOpenUrlA",
         "InternetOpenUrlW",
+        "InternetConnectA",
+        "InternetConnectW",
         "WSAStartup",
         "HttpOpenRequestA",
         "HttpOpenRequestW",
+        "WinHttpConnect",
+        "WinHttpOpenRequest",
+        "WinHttpSendRequest",
         "URLDownloadToFileA",
         "URLDownloadToFileW",
         "socket",
@@ -727,6 +779,12 @@ fn detect_malware_pattern(
         "sendto",
         "recvfrom",
     ]);
+    let has_endpoint = has_category(&StringCategory::Url)
+        || has_category(&StringCategory::Domain)
+        || has_category(&StringCategory::IpAddress)
+        || pe.as_ref().is_some_and(|p| {
+            p.xor_payloads.iter().any(|payload| payload.description == "XOR-encoded URL")
+        });
 
     let process_injection = has_all_apis(&[
         "VirtualAllocEx",
@@ -887,18 +945,18 @@ fn detect_malware_pattern(
         });
     }
 
-    // 4. Trojan.Downloader — network + commands + URLs (Medium)
+    // 4. Trojan.Downloader — network + commands + endpoints (Medium)
     let has_commands = has_category(&StringCategory::Command);
-    let has_urls = has_category(&StringCategory::Url);
-    if network_apis && has_commands && has_urls {
+    let has_endpoints = has_category(&StringCategory::Url) || has_category(&StringCategory::Domain);
+    if network_apis && has_commands && has_endpoints {
         return Some(MalwarePattern {
             family: "Trojan.Downloader".into(),
             confidence: "Medium".into(),
-            description: "Network APIs with command execution and URL references".into(),
+            description: "Network APIs with command execution and endpoint references".into(),
             matched_indicators: vec![
                 "Network API imports".into(),
                 "Command strings found".into(),
-                "URLs found in strings".into(),
+                "Endpoints found in strings".into(),
             ],
         });
     }
@@ -938,13 +996,14 @@ fn detect_malware_pattern(
         });
     }
 
-    // 7. Trojan.C2Agent — API hashing / dynamic resolution with hidden/sparse imports (High)
+    // 7. Evasive loader, upgraded to C2 only with network and endpoint evidence
     if let Some(pe) = pe {
         let total_imports: usize = pe.imports.iter().map(|dll| dll.functions.len()).sum();
         let is_sparse_imports = total_imports <= 35 || pe.imports.len() <= 3;
         let has_stealth_loading = pe.api_hashing || pe.peb_walking || pe.direct_syscalls || pe.indirect_syscalls;
 
         if has_stealth_loading && is_sparse_imports {
+            let is_c2 = network_apis && has_endpoint;
             let mut indicators = Vec::new();
             if pe.api_hashing {
                 indicators.push("API Hashing loop detected (dynamic export resolution)".into());
@@ -956,11 +1015,18 @@ fn detect_malware_pattern(
                 indicators.push("Custom Syscall stubs detected".into());
             }
             indicators.push(format!("Sparse/hidden import table ({} imported APIs across {} DLLs)", total_imports, pe.imports.len()));
+            if is_c2 {
+                indicators.push("Network APIs and a decoded URL/IP endpoint".into());
+            }
 
             return Some(MalwarePattern {
-                family: "Trojan.C2Agent".into(),
-                confidence: "High".into(),
-                description: "Stealth implant / C2 agent utilizing API hashing or evasive system calls with minimal import table footprint".into(),
+                family: if is_c2 { "Trojan.C2Agent".into() } else { "Loader.Evasive".into() },
+                confidence: "Medium".into(),
+                description: if is_c2 {
+                    "Evasive loading combined with network APIs and a URL/IP endpoint".into()
+                } else {
+                    "Evasive loading with a minimal import table, without C2 network evidence".into()
+                },
                 matched_indicators: indicators,
             });
         }
@@ -1014,6 +1080,69 @@ pub fn resolve_syscall_name(ssn: u32) -> &'static str {
         0xbd | 0xc2 | 0xc7 => "possibly NtCreateThreadEx",
         _ => "unknown NT API",
     }
+}
+
+pub fn resolve_hashed_apis(data: &[u8]) -> Vec<String> {
+    const APIS: &[&str] = &[
+        "LoadLibraryA", "LoadLibraryW", "GetProcAddress", "LdrLoadDll",
+        "VirtualAlloc", "VirtualAllocEx", "VirtualProtect", "VirtualProtectEx",
+        "WriteProcessMemory", "CreateRemoteThread", "NtCreateThreadEx",
+        "RtlCreateUserThread", "QueueUserAPC", "SetThreadContext",
+        "CreateProcessA", "CreateProcessW", "WinExec", "ShellExecuteA", "ShellExecuteW",
+        "InternetOpenA", "InternetOpenW", "InternetConnectA", "InternetConnectW",
+        "InternetOpenUrlA", "InternetOpenUrlW", "InternetReadFile",
+        "HttpOpenRequestA", "HttpOpenRequestW", "HttpSendRequestA", "HttpSendRequestW",
+        "WinHttpOpen", "WinHttpConnect", "WinHttpOpenRequest", "WinHttpSendRequest",
+        "WinHttpReceiveResponse", "WinHttpReadData", "URLDownloadToFileA", "URLDownloadToFileW",
+        "WSAStartup", "socket", "connect", "send", "recv", "sendto", "recvfrom",
+        "getaddrinfo", "DnsQuery_A", "DnsQuery_W", "CreateServiceA", "CreateServiceW",
+        "RegSetValueExA", "RegSetValueExW", "CryptEncrypt", "CryptDecrypt",
+        "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess",
+    ];
+
+    fn ror13_add(data: &[u8]) -> u32 {
+        data.iter().fold(0u32, |hash, &byte| hash.rotate_right(13).wrapping_add(byte as u32))
+    }
+
+    fn rol7_xor(data: &[u8]) -> u32 {
+        data.iter().fold(0u32, |hash, &byte| hash.rotate_left(7) ^ byte as u32)
+    }
+
+    fn fnv1a(data: &[u8]) -> u32 {
+        data.iter().fold(0x811C9DC5u32, |hash, &byte| (hash ^ byte as u32).wrapping_mul(0x01000193))
+    }
+
+    fn djb2(data: &[u8]) -> u32 {
+        data.iter().fold(5381u32, |hash, &byte| hash.wrapping_mul(33).wrapping_add(byte as u32))
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    let mut hashes: std::collections::HashMap<u32, Vec<&str>> = std::collections::HashMap::new();
+    for &api in APIS {
+        let bytes = api.as_bytes();
+        for hash in [ror13_add(bytes), rol7_xor(bytes), fnv1a(bytes), djb2(bytes), crc32(bytes)] {
+            hashes.entry(hash).or_default().push(api);
+        }
+    }
+
+    let mut resolved = std::collections::BTreeSet::new();
+    for bytes in data.windows(4) {
+        let hash = u32::from_le_bytes(bytes.try_into().unwrap());
+        if let Some(apis) = hashes.get(&hash) {
+            resolved.extend(apis.iter().copied());
+        }
+    }
+    resolved.into_iter().map(str::to_string).collect()
 }
 
 pub fn scan_peb_and_hashing(bitness: u32, section_data: &[u8], virtual_address: u64) -> (bool, bool, bool, bool, Vec<SyscallLocation>) {
@@ -1278,5 +1407,203 @@ mod tests {
         assert!(indirect);
         assert_eq!(locations.len(), 1);
         assert!(locations[0].is_indirect);
+    }
+
+    fn basic_analysis(strings: Vec<ExtractedString>) -> BasicAnalysis {
+        BasicAnalysis {
+            md5: String::new(),
+            sha1: String::new(),
+            sha256: String::new(),
+            entropy: 0.0,
+            strings,
+            is_packed: false,
+            byte_distribution: vec![0; 256],
+        }
+    }
+
+    fn evasive_pe(imports: Vec<ImportDll>, xor_payloads: Vec<XorPayloadMatch>) -> PeAnalysis {
+        PeAnalysis {
+            machine: "x86-64".into(),
+            timestamp: 0,
+            timestamp_str: String::new(),
+            entry_point: 0x1000,
+            image_base: 0x140000000,
+            subsystem: "Windows CUI".into(),
+            is_dll: false,
+            is_64bit: true,
+            linker_version: String::new(),
+            sections: Vec::new(),
+            imports,
+            exports: Vec::new(),
+            anomalies: Vec::new(),
+            packer_detected: None,
+            compilation_age: String::new(),
+            timestamp_suspicious: false,
+            characteristics: 0,
+            dll_characteristics: 0,
+            data_directories: Vec::new(),
+            entry_point_section: None,
+            has_authenticode: false,
+            ep_bytes: Vec::new(),
+            overlay_offset: None,
+            overlay_size: None,
+            obfuscated_apis: Vec::new(),
+            embedded_pe: None,
+            peb_walking: false,
+            api_hashing: true,
+            resolved_apis: Vec::new(),
+            pdb_path: None,
+            manifest: None,
+            direct_syscalls: false,
+            indirect_syscalls: false,
+            syscall_locations: Vec::new(),
+            imphash: None,
+            rich_header: None,
+            certificate: None,
+            xor_payloads,
+            tls_info: None,
+            resources: Vec::new(),
+        }
+    }
+
+    fn network_import() -> ImportDll {
+        ImportDll {
+            name: "ws2_32.dll".into(),
+            functions: vec![ImportFunction { name: "connect".into(), risk: ApiRisk::Medium }],
+        }
+    }
+
+    #[test]
+    fn test_evasive_loader_without_endpoint_is_not_c2() {
+        let basic = basic_analysis(Vec::new());
+        let pe = Some(evasive_pe(vec![network_import()], Vec::new()));
+        let checks = build_detection_checks(&basic, &pe, &None, &None, 20_000);
+
+        assert!(checks.iter().any(|check| check.name.starts_with("Evasive Loader Profile") && check.triggered));
+        assert!(!checks.iter().any(|check| check.name.starts_with("C2 Agent Profile") && check.triggered));
+        assert_eq!(detect_malware_pattern(&basic, &pe, &None, &None).unwrap().family, "Loader.Evasive");
+    }
+
+    #[test]
+    fn test_c2_uses_decoded_endpoint_and_network() {
+        let basic = basic_analysis(vec![ExtractedString {
+            value: "aHR0cHM6Ly9jMi5leGFtcGxlL2dhdGU=".into(),
+            offset: 0,
+            category: StringCategory::Url,
+            decoded: Some("https://c2.example/gate".into()),
+            network: None,
+            is_wide: false,
+        }]);
+        let pe = Some(evasive_pe(vec![network_import()], Vec::new()));
+        let checks = build_detection_checks(&basic, &pe, &None, &None, 20_000);
+
+        assert!(checks.iter().any(|check| check.name.starts_with("C2 Agent Profile") && check.triggered));
+        assert_eq!(detect_malware_pattern(&basic, &pe, &None, &None).unwrap().family, "Trojan.C2Agent");
+    }
+
+    #[test]
+    fn test_c2_uses_bare_domain() {
+        let basic = basic_analysis(vec![ExtractedString {
+            value: "c2.example:8443/gate".into(),
+            offset: 0,
+            category: StringCategory::Domain,
+            decoded: None,
+            network: Some(NetworkIndicator {
+                value: "c2.example:8443/gate".into(),
+                host: "c2.example".into(),
+                port: Some(8443),
+                path: Some("/gate".into()),
+            }),
+            is_wide: false,
+        }]);
+        let pe = Some(evasive_pe(vec![network_import()], Vec::new()));
+
+        assert_eq!(detect_malware_pattern(&basic, &pe, &None, &None).unwrap().family, "Trojan.C2Agent");
+    }
+
+    #[test]
+    fn test_c2_uses_xor_endpoint() {
+        let basic = basic_analysis(Vec::new());
+        let pe = Some(evasive_pe(vec![network_import()], vec![XorPayloadMatch {
+            key: 0x42,
+            offset: 0x500,
+            target_location: "Overlay".into(),
+            description: "XOR-encoded URL".into(),
+            sample_preview: "https://c2.example/gate".into(),
+        }]));
+
+        assert_eq!(detect_malware_pattern(&basic, &pe, &None, &None).unwrap().family, "Trojan.C2Agent");
+    }
+
+    #[test]
+    fn test_resolve_five_api_hash_algorithms() {
+        let hashes: [u32; 10] = [
+            0x60AAF9EC, 0xEDD8FE8A, 0xAAE0CCF9, 0xD3764DCF, 0x74CFF91F,
+            0x98348882, 0x7CD7FB0A, 0xE0CFB564, 0xB183FAA6, 0xCEE9B4F7,
+        ];
+        let mut data = vec![0x90];
+        for hash in hashes {
+            data.extend_from_slice(&hash.to_le_bytes());
+            data.push(0x90);
+        }
+
+        let resolved = resolve_hashed_apis(&data);
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().any(|api| api == "connect"));
+        assert!(resolved.iter().any(|api| api == "WinHttpSendRequest"));
+    }
+
+    #[test]
+    fn test_resolved_api_feeds_c2_detection() {
+        let basic = basic_analysis(vec![ExtractedString {
+            value: "https://c2.example/gate".into(),
+            offset: 0,
+            category: StringCategory::Url,
+            decoded: None,
+            network: None,
+            is_wide: false,
+        }]);
+        let mut pe = evasive_pe(Vec::new(), Vec::new());
+        pe.resolved_apis.push("connect".into());
+        let pe = Some(pe);
+
+        assert!(has_imported_api(&pe, &None, &None, &["connect"]));
+        assert_eq!(detect_malware_pattern(&basic, &pe, &None, &None).unwrap().family, "Trojan.C2Agent");
+    }
+
+    #[test]
+    fn test_malformed_binary_returns_error() {
+        let cases: &[(&str, &[u8])] = &[
+            ("bad.exe", b"MZ"),
+            ("bad.elf", b"\x7FELF"),
+            ("bad.macho", b"\xFE\xED\xFA\xCF"),
+        ];
+        for (name, bytes) in cases {
+            let path = std::env::temp_dir().join(format!("hacksguard_{}_{}", std::process::id(), name));
+            std::fs::write(&path, bytes).unwrap();
+            let result = analyze_file(&path, None, false);
+            let _ = std::fs::remove_file(path);
+            assert!(result.is_err(), "{} should fail", name);
+        }
+    }
+
+    #[test]
+    fn test_yara_external_symbols_are_defined() {
+        let path = std::env::temp_dir().join(format!("hacksguard_external_{}.yar", std::process::id()));
+        std::fs::write(&path, b"rule External { condition: filename == \"\" and filepath == \"\" and extension == \"\" and owner == \"\" }").unwrap();
+        let (_, errors) = compile_yara_rules(&[path.clone()]);
+        let _ = std::fs::remove_file(path);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_invalid_yara_rule_is_reported() {
+        let path = std::env::temp_dir().join(format!("hacksguard_invalid_{}.yar", std::process::id()));
+        std::fs::write(&path, b"rule Broken { condition: }").unwrap();
+        let (_, errors) = compile_yara_rules(&[path.clone()]);
+        let _ = std::fs::remove_file(path);
+
+        assert!(!errors.is_empty());
     }
 }

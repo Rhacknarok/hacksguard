@@ -19,7 +19,7 @@ Hacksguard is a blazingly fast, multi-threaded Terminal UI (TUI) static analysis
 - **1-Byte XOR Payload Brute-Forcer**: High-speed single-pass scanner detecting obfuscated PE binaries (`MZ...PE`), DOS stubs, and URLs hidden inside overlays or high-entropy sections.
 - **Direct & Indirect Syscall Detection**: Automated scanning for evasion techniques including x86/x64 direct/indirect syscalls (`syscall`, `sysenter`, `int 0x80`) and ARM64 supervisor calls (`svc #0` on Linux AArch64, `svc #0x80` on macOS ARM64).
 - **Visual Entropy Graph**: A dedicated Entropy tab plots the Shannon entropy distribution of the file using sparklines, allowing analysts to visually spot encrypted or packed payloads instantly.
-- **ASCII & UTF-16LE Strings**: Automatically extracts and categorizes ASCII and UTF-16LE wide strings (IPs, URLs, Registry keys, commands) with live interactive filtering (`/`) and category shortcuts (`u/i/r/c/s/p/a`).
+- **ASCII & UTF-16LE Strings**: Automatically extracts and categorizes ASCII and UTF-16LE wide strings (IPv4/IPv6, URLs, domains, ports, HTTP paths, Registry keys, commands) with live interactive filtering (`/`) and category shortcuts (`u/d/i/r/c/s/p/a`).
 - **Built-in Disassembler & Hex View**: Inspect Entry Point instructions (x86/x64 decoded via `iced-x86`, ARM64 instruction word formatting with syscall highlighting) or dive into raw bytes with the Hex Dump viewer.
 - **PE TLS Callbacks & Pre-EP Execution Forensics**: Deep parsing of 32-bit and 64-bit Thread Local Storage (TLS) directories, enumerating callbacks executed prior to the binary EntryPoint to spot stealthy pre-EP loader stubs.
 - **PE Resource Directory (`.rsrc`) Tree & Magic Detection**: Full 3-level tree traversal (`Type -> Name/ID -> Language`) with per-resource Shannon entropy, embedded magic byte hints (`PE (MZ)`, `ELF`, `ZIP`, `CAB`, `GZIP`), and dedicated TUI tab.
@@ -75,7 +75,7 @@ cargo run --release -- <path/to/binary.exe>
 - `y`: Copy to Clipboard (OSC 52 - copies active hash or string)
 - `d`: Carve Payloads (extract overlays, decrypted XOR, embedded PE, suspicious resources to disk)
 - `e`: Toggle Embedded PE View (when secondary executable is detected)
-- `u` / `i` / `r` / `c` / `s` / `p` / `a`: Quick category filter in Strings view (URLs, IPs, Reg, Cmd, Suspicious, Path, All)
+- `u` / `d` / `i` / `r` / `c` / `s` / `p` / `a`: Quick category filter in Strings view (URLs, Domains, IPs, Reg, Cmd, Suspicious, Path, All)
 - `Esc`: Clear search / category filter / close modals (or Quit if clean)
 - `q`: Quit
 

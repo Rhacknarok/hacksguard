@@ -870,6 +870,7 @@ fn build_suspicious_strings_lines(lines: &mut Vec<Line<'static>>, app: &App) {
         for s in sorted.iter().take(5) {
             let color = match s.category {
                 StringCategory::Url => theme::CRITICAL,
+                StringCategory::Domain => theme::CRITICAL,
                 StringCategory::IpAddress => theme::ORANGE,
                 StringCategory::Command => theme::CRITICAL,
                 StringCategory::Suspicious => theme::ORANGE,
@@ -976,7 +977,7 @@ fn build_yara_lines(lines: &mut Vec<Line<'static>>, app: &App) {
         lines.push(Line::from(vec![
             Span::styled(format!(" {} Scanning with YARA...", spinners[idx]), Style::default().fg(theme::ORANGE)),
         ]));
-    } else if app.result.yara_matches.is_empty() {
+    } else if app.result.yara_matches.is_empty() && app.result.yara_errors.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(" No YARA rules matched", theme::label()),
         ]));
@@ -990,6 +991,12 @@ fn build_yara_lines(lines: &mut Vec<Line<'static>>, app: &App) {
                 Span::styled(rule.clone(), Style::default().fg(theme::CRITICAL)),
             ]));
         }
+    }
+    for error in &app.result.yara_errors {
+        lines.push(Line::from(vec![
+            Span::styled(" ! ", theme::CRITICAL),
+            Span::styled(error.clone(), Style::default().fg(theme::CRITICAL)),
+        ]));
     }
     lines.push(Line::from(""));
 }
@@ -1487,6 +1494,25 @@ fn draw_imports(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
     }
 
+    let matching_resolved: Vec<&String> = pe
+        .resolved_apis
+        .iter()
+        .filter(|api| query_lower.is_empty() || api.to_lowercase().contains(&query_lower))
+        .collect();
+    if !matching_resolved.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            " Hash-Resolved APIs",
+            Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
+        )]));
+        for api in matching_resolved {
+            lines.push(Line::from(vec![
+                Span::styled("    ◉ ", Style::default().fg(theme::WARNING)),
+                Span::styled(api, Style::default().fg(theme::TEXT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
     // Per-DLL listing
     for dll in &pe.imports {
         let matching_funcs: Vec<&ImportFunction> = dll
@@ -1595,6 +1621,7 @@ fn draw_strings(frame: &mut Frame, area: Rect, app: &App) {
     let cats = [
         (None, "a", "All"),
         (Some(StringCategory::Url), "u", "URL"),
+        (Some(StringCategory::Domain), "d", "Domain"),
         (Some(StringCategory::IpAddress), "i", "IP"),
         (Some(StringCategory::RegistryKey), "r", "Reg"),
         (Some(StringCategory::Command), "c", "Cmd"),
@@ -1622,6 +1649,7 @@ fn draw_strings(frame: &mut Frame, area: Rect, app: &App) {
     for s in filtered.iter().take(500) {
         let cat_color = match s.category {
             StringCategory::Url => theme::CRITICAL,
+            StringCategory::Domain => theme::CRITICAL,
             StringCategory::IpAddress => theme::ORANGE,
             StringCategory::RegistryKey => theme::WARNING,
             StringCategory::Command => theme::CRITICAL,
@@ -1730,10 +1758,11 @@ fn category_priority(cat: &StringCategory) -> u8 {
         StringCategory::Command => 0,
         StringCategory::Suspicious => 1,
         StringCategory::Url => 2,
-        StringCategory::IpAddress => 3,
-        StringCategory::RegistryKey => 4,
-        StringCategory::FilePath => 5,
-        StringCategory::Normal => 6,
+        StringCategory::Domain => 3,
+        StringCategory::IpAddress => 4,
+        StringCategory::RegistryKey => 5,
+        StringCategory::FilePath => 6,
+        StringCategory::Normal => 7,
     }
 }
 

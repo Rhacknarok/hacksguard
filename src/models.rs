@@ -19,6 +19,7 @@ pub struct AnalysisResult {
     pub detection_checks: Vec<DetectionCheck>,
     pub malware_pattern: Option<MalwarePattern>,
     pub yara_matches: Vec<String>,
+    pub yara_errors: Vec<String>,
     pub entropy_graph: Vec<u64>,
 }
 
@@ -95,13 +96,23 @@ pub struct ExtractedString {
     pub offset: usize,
     pub category: StringCategory,
     pub decoded: Option<String>,
+    pub network: Option<NetworkIndicator>,
     pub is_wide: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NetworkIndicator {
+    pub value: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[derive(serde::Serialize)]
 pub enum StringCategory {
     Url,
+    Domain,
     IpAddress,
     FilePath,
     RegistryKey,
@@ -114,6 +125,7 @@ impl fmt::Display for StringCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Url => write!(f, "URL"),
+            Self::Domain => write!(f, "DOM"),
             Self::IpAddress => write!(f, "IP"),
             Self::FilePath => write!(f, "PATH"),
             Self::RegistryKey => write!(f, "REG"),
@@ -156,6 +168,7 @@ pub struct PeAnalysis {
     pub embedded_pe: Option<Box<PeAnalysis>>,
     pub peb_walking: bool,
     pub api_hashing: bool,
+    pub resolved_apis: Vec<String>,
     pub pdb_path: Option<String>,
     pub manifest: Option<String>,
     pub direct_syscalls: bool,
